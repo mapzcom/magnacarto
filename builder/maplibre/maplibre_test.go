@@ -253,15 +253,15 @@ func TestLayerInfo(t *testing.T) {
 
 func TestUnsupportedSymbolizerIsReported(t *testing.T) {
 	m, style := build(t, `
-		#labels { text-name: [name]; text-face-name: 'Arial'; text-size: 10; }
+		#labels { shield-name: [name]; shield-face-name: 'Arial'; shield-size: 10; shield-file: url(a.svg); }
 	`, "labels")
 
 	if len(layers(style)) != 0 {
 		t.Errorf("expected no layers, got %v", layers(style))
 	}
 	notes := m.Notes()
-	if len(notes) != 1 || notes[0].Property != "text-" || notes[0].Kind != Omitted {
-		t.Errorf("expected an omitted text symbolizer note, got %+v", notes)
+	if len(notes) != 1 || notes[0].Property != "shield-" || notes[0].Kind != Omitted {
+		t.Errorf("expected an omitted shield symbolizer note, got %+v", notes)
 	}
 }
 
@@ -521,4 +521,324 @@ func TestBlendApproximatesLineCompOp(t *testing.T) {
 	if g := strings.Join(got, "|"); g != want {
 		t.Errorf("notes\n got  %s\n want %s", g, want)
 	}
+}
+
+func TestTextLayer(t *testing.T) {
+	m, style := build(t, `
+		#places[zoom>=10] {
+			text-name: '[name]';
+			text-face-name: 'Fira Sans Bold', 'Unifont Medium';
+			text-size: 10;
+			text-fill: #333333;
+			text-halo-radius: 1.5;
+			text-wrap-width: 50;
+			text-character-spacing: 2;
+			text-transform: uppercase;
+			text-repeat-distance: 100;
+			[zoom>=12] { text-size: 20; }
+		}
+	`, "places")
+
+	l := layerByID(t, style, "places::::text")
+	if l["type"] != "symbol" || l["source-layer"] != "places" || l["minzoom"].(float64) != 9 {
+		t.Errorf("unexpected layer header %v", l)
+	}
+	assertJSON(t, "layout", l["layout"], `{
+		"symbol-z-order": "source",
+		"text-field": ["get", "name"],
+		"text-font": ["literal", ["Fira Sans Bold", "Unifont Medium"]],
+		"text-justify": "auto",
+		"text-letter-spacing": ["step", ["zoom"], 0.2, 11, 0.1],
+		"text-max-width": ["step", ["zoom"], 5, 11, 2.5],
+		"text-padding": 0,
+		"text-size": ["step", ["zoom"], 10, 11, 20],
+		"text-transform": "uppercase"
+	}`)
+	assertJSON(t, "paint", l["paint"], `{
+		"text-color": "#333333",
+		"text-halo-color": "#ffffff",
+		"text-halo-width": 1.5
+	}`)
+	assertJSON(t, "omitted", notesOf(m, Omitted), `["text-repeat-distance"]`)
+}
+
+func TestTextWithoutWrapWidthDoesNotWrap(t *testing.T) {
+	_, style := build(t, `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10; }`, "places")
+	l := layerByID(t, style, "places::::text")
+	assertJSON(t, "text-max-width", l["layout"].(map[string]interface{})["text-max-width"], `1000`)
+}
+
+func TestTextNeedsNameAndSize(t *testing.T) {
+	_, style := build(t, `
+		#places {
+			text-name: [name]; text-face-name: 'Arial'; text-size: 10;
+			[type='hidden'] { text-name: ''; }
+			[type='nosize'] { text-size: 0; }
+		}
+	`, "places")
+	l := layerByID(t, style, "places::::text")
+	assertJSON(t, "filter", l["filter"], `["match", ["get", "type"], ["nosize", "hidden"], false, true]`)
+}
+
+func TestTextNameConcatenatesFieldsAndLiterals(t *testing.T) {
+	_, style := build(t, `
+		#a { text-name: '('+'[name]'+')'; text-face-name: 'Arial'; text-size: 10; }
+		#b { text-name: "Taxi"; text-face-name: 'Arial'; text-size: 10; }
+		#c { text-name: "[ref] [name]"; text-face-name: 'Arial'; text-size: 10; }
+	`, "a", "b", "c")
+	assertJSON(t, "a", layerByID(t, style, "a::::text")["layout"].(map[string]interface{})["text-field"],
+		`["concat", "(", ["get", "name"], ")"]`)
+	assertJSON(t, "b", layerByID(t, style, "b::::text")["layout"].(map[string]interface{})["text-field"], `"Taxi"`)
+	assertJSON(t, "c", layerByID(t, style, "c::::text")["layout"].(map[string]interface{})["text-field"],
+		`["concat", ["get", "ref"], " ", ["get", "name"]]`)
+}
+
+func TestTextDisplacementBecomesAnchor(t *testing.T) {
+	_, style := build(t, `
+		#places {
+			text-name: [name]; text-face-name: 'Arial'; text-size: 10;
+			[type='a'] { text-dx: 5; text-dy: -10; }
+			[type='b'] { text-dy: 5; text-horizontal-alignment: middle; text-vertical-alignment: middle; }
+		}
+	`, "places")
+	l := layerByID(t, style, "places::::text")
+	assertJSON(t, "anchor", l["layout"].(map[string]interface{})["text-variable-anchor-offset"], `["match", ["get", "type"],
+		"b", ["literal", ["center", [0, 0.5]]],
+		"a", ["literal", ["bottom-left", [0.5, -1]]],
+		["literal", ["center", [0, 0]]]]`)
+}
+
+func TestTextPlacementsBecomeVariableAnchors(t *testing.T) {
+	m, style := build(t, `
+		#places {
+			text-name: [name]; text-face-name: 'Arial'; text-size: 10;
+			text-placement-type: simple; text-placements: "N,E,SW,9,8";
+			text-dx: 4; text-dy: 6; text-justify-alignment: center;
+		}
+	`, "places")
+	l := layerByID(t, style, "places::::text")
+	layout := l["layout"].(map[string]interface{})
+	assertJSON(t, "anchor", layout["text-variable-anchor-offset"],
+		`["literal", ["bottom", [0, -0.6], "left", [0.4, 0], "top-right", [-0.4, 0.6]]]`)
+	assertJSON(t, "justify", layout["text-justify"], `"center"`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["text-placements"]`)
+}
+
+func TestLineLabel(t *testing.T) {
+	_, style := build(t, `
+		#roads { text-name: [name]; text-face-name: 'Arial'; text-size: 10;
+			text-placement: line; text-dy: 5; text-spacing: 300; text-max-char-angle-delta: 30; }
+	`, "roads")
+	l := layerByID(t, style, "roads::::text")
+	layout := l["layout"].(map[string]interface{})
+	assertJSON(t, "placement", layout["symbol-placement"], `"line"`)
+	assertJSON(t, "spacing", layout["symbol-spacing"], `300`)
+	assertJSON(t, "max-angle", layout["text-max-angle"], `30`)
+	assertJSON(t, "offset", layout["text-offset"], `["literal", [0, 0.5]]`)
+	if _, ok := layout["text-variable-anchor-offset"]; ok {
+		t.Errorf("unexpected anchor for line placement: %v", layout["text-variable-anchor-offset"])
+	}
+}
+
+func TestSymbolLayersComeLastInReverseOrder(t *testing.T) {
+	_, style := build(t, `
+		#roads { line-width: 1; }
+		#blocker { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-opacity: 0; }
+		#labels { text-name: [name]; text-face-name: 'Arial'; text-size: 10; }
+		#borders { line-width: 2; }
+	`, "roads", "blocker", "labels", "borders")
+	var ids []interface{}
+	for _, l := range layers(style) {
+		ids = append(ids, l["id"])
+	}
+	assertJSON(t, "order", ids, `["roads::::line", "borders::::line", "labels::::text", "blocker::::text"]`)
+	assertJSON(t, "blocker paint", layerByID(t, style, "blocker::::text")["paint"], `{"text-opacity": 0}`)
+}
+
+func TestMatchHoistedOutOfDifferingConditions(t *testing.T) {
+	_, style := build(t, `
+		#land {
+			[type='forest'], [type='wood'] { line-color: #00ff00; }
+			[type='park'] { line-color: #00aa00; }
+			line-width: 1;
+			[area>=100] { line-width: 2; }
+			[area>=10] { line-width: 3; }
+		}
+	`, "land")
+	l := layerByID(t, style, "land::::line")
+	// Without hoisting these are case chains over all type × area rules.
+	// [area>=10] comes later with the same specificity and wins.
+	assertJSON(t, "line-width", l["paint"].(map[string]interface{})["line-width"], `["case",
+		["all", ["==", ["typeof", ["get", "area"]], "number"], [">=", ["get", "area"], 10]], 3,
+		["all", ["==", ["typeof", ["get", "area"]], "number"], [">=", ["get", "area"], 100]], 2,
+		1]`)
+	assertJSON(t, "line-color", l["paint"].(map[string]interface{})["line-color"],
+		`["match", ["get", "type"], "park", "#00aa00", ["wood", "forest"], "#00ff00", "#000000"]`)
+}
+
+func TestHoistedMatchKeepsFirstMatch(t *testing.T) {
+	entries := []caseEntry{
+		{[]interface{}{"all", []interface{}{"==", []interface{}{"get", "type"}, "a"}, []interface{}{">", []interface{}{"get", "n"}, 1.0}}, 1.0},
+		{[]interface{}{">", []interface{}{"get", "n"}, 5.0}, 2.0},
+		{[]interface{}{"all", []interface{}{"==", []interface{}{"get", "type"}, "b"}, []interface{}{">", []interface{}{"get", "n"}, 1.0}}, 3.0},
+		{[]interface{}{"==", []interface{}{"get", "type"}, "a"}, 4.0},
+	}
+	got, ok := hoistedMatch(entries, 0.0)
+	if !ok {
+		t.Fatal("not hoisted")
+	}
+	assertJSON(t, "expr", got, `["match", ["get", "type"],
+		"a", ["case", [">", ["get", "n"], 1], 1, [">", ["get", "n"], 5], 2, 4],
+		"b", ["case", [">", ["get", "n"], 5], 2, [">", ["get", "n"], 1], 3, 0],
+		["case", [">", ["get", "n"], 5], 2, 0]]`)
+}
+
+func TestDuplicateConjunctsAreDropped(t *testing.T) {
+	_, style := build(t, `#land[area>=10][area<100] { line-width: 1; }`, "land")
+	assertJSON(t, "filter", layerByID(t, style, "land::::line")["filter"], `["all",
+		["==", ["typeof", ["get", "area"]], "number"], [">=", ["get", "area"], 10], ["<", ["get", "area"], 100]]`)
+}
+
+func TestPassesBecomeFurtherAnchors(t *testing.T) {
+	m, style := build(t, `
+		#places[zoom>=14] {
+			::center, ::var1, ::var2 {
+				text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 100;
+				::var1, ::var2 { text-placement-type: simple; text-placements: "W,E"; }
+				::var1 { text-dx: 4; }
+				::var2 { text-dx: 8; [zoom>=16] { text-dx: 16; } }
+			}
+		}
+	`, "places")
+	var ids []interface{}
+	for _, l := range layers(style) {
+		ids = append(ids, l["id"])
+	}
+	assertJSON(t, "layers", ids, `["places::center::text"]`)
+	l := layerByID(t, style, "places::center::text")
+	assertJSON(t, "anchors", l["layout"].(map[string]interface{})["text-variable-anchor-offset"], `["step", ["zoom"],
+		["literal", ["center", [0, 0], "right", [-0.4, 0], "left", [0.4, 0], "right", [-0.8, 0], "left", [0.8, 0]]],
+		15,
+		["literal", ["center", [0, 0], "right", [-0.4, 0], "left", [0.4, 0], "right", [-1.6, 0], "left", [1.6, 0]]]]`)
+	var merged []string
+	for _, n := range m.Notes() {
+		if n.Property == "text-" && n.Kind == Approximated {
+			merged = append(merged, n.Attachment)
+		}
+	}
+	assertJSON(t, "merged passes", merged, `["var1", "var2"]`)
+}
+
+func TestDifferentPassesAreNotMerged(t *testing.T) {
+	_, style := build(t, `
+		#places {
+			::a { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 100; }
+			::b { text-name: [ref]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 100; text-dx: 4; }
+			::c { text-name: [ref]; text-face-name: 'Arial'; text-size: 10; text-dx: 8; }
+		}
+	`, "places")
+	if n := len(layers(style)); n != 3 {
+		t.Errorf("%d layers, want 3: other text, or no repeat distance", n)
+	}
+}
+
+func TestPassWithPlacementExceptionAndOtherSymbolizers(t *testing.T) {
+	_, style := build(t, `
+		#places {
+			::center, ::var1 {
+				text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 50;
+				line-width: 1;
+			}
+			::var1 { text-dx: 4; [name='Spain'] { text-dy: 12; } }
+		}
+	`, "places")
+	var ids []interface{}
+	for _, l := range layers(style) {
+		ids = append(ids, l["id"])
+	}
+	assertJSON(t, "layers", ids, `["places::center::line", "places::var1::line", "places::center::text"]`)
+	assertJSON(t, "anchors", layerByID(t, style, "places::center::text")["layout"].(map[string]interface{})["text-variable-anchor-offset"],
+		`["literal", ["center", [0, 0], "left", [0.4, 0]]]`)
+}
+
+func TestPassMayLackRulesWithoutText(t *testing.T) {
+	_, style := build(t, `
+		#places[zoom>=8] {
+			::center, ::var1[zoom>=9] {
+				line-width: 1;
+				[zoom>=9] { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 50; }
+			}
+			::var1 { text-dx: 4; }
+		}
+	`, "places")
+	if _, ok := layerByID(t, style, "places::center::text")["layout"].(map[string]interface{})["text-variable-anchor-offset"]; !ok {
+		t.Error("var1 not merged")
+	}
+	for _, l := range layers(style) {
+		if l["id"] == "places::var1::text" {
+			t.Error("var1 not merged")
+		}
+	}
+}
+
+func TestLineLabelsAreSplitWhereTextSizeChanges(t *testing.T) {
+	_, style := build(t, `
+		#roads[zoom>=12] {
+			text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-placement: line;
+			[zoom>=14] { text-size: 12; [type='primary'] { text-size: 14; } }
+			[zoom>=16] { text-size: 20; }
+		}
+		#places[zoom>=12] { text-name: [name]; text-face-name: 'Arial'; text-size: 10; [zoom>=14] { text-size: 12; } }
+	`, "roads", "places")
+	var ids []interface{}
+	for _, l := range layers(style) {
+		ids = append(ids, l["id"])
+	}
+	// MapLibre fits line labels with text-size at zoom 18.
+	assertJSON(t, "layers", ids, `["places::::text", "roads::::text#zoom=15", "roads::::text#zoom=13", "roads::::text#zoom=11"]`)
+	for id, want := range map[string]string{
+		"roads::::text#zoom=11": `[11, 13, 10]`,
+		"roads::::text#zoom=13": `[13, 15, ["case", ["==", ["get", "type"], "primary"], 14, 12]]`,
+		"roads::::text#zoom=15": `[15, null, ["case", ["==", ["get", "type"], "primary"], 14, 20]]`,
+	} {
+		l := layerByID(t, style, id)
+		assertJSON(t, id, []interface{}{l["minzoom"], l["maxzoom"], l["layout"].(map[string]interface{})["text-size"]}, want)
+	}
+}
+
+func TestPassesAreMergedPerZoom(t *testing.T) {
+	_, style := build(t, `
+		#places[zoom>=12] {
+			::center, ::var1 {
+				[zoom=12][weight>=100], [zoom>=13] {
+					text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 50;
+				}
+			}
+			::var1 { text-dx: 4; [zoom=12] { text-name: [name]; text-face-name: 'Arial'; text-size: 11; text-repeat-distance: 50; } }
+		}
+	`, "places")
+	// At Mapnik zoom 12 var1 draws more features than center: it stays a
+	// layer of its own there, and is merged from zoom 13.
+	l := layerByID(t, style, "places::var1::text")
+	if l["minzoom"].(float64) != 11 || l["maxzoom"].(float64) != 12 {
+		t.Errorf("var1 at %v-%v, want only style zoom 11", l["minzoom"], l["maxzoom"])
+	}
+	assertJSON(t, "anchors", layerByID(t, style, "places::center::text")["layout"].(map[string]interface{})["text-variable-anchor-offset"],
+		`["step", ["zoom"], ["literal", ["center", [0, 0]]], 12, ["literal", ["center", [0, 0], "left", [0.4, 0]]]]`)
+}
+
+func TestPassForOtherFeaturesIsNotMerged(t *testing.T) {
+	_, style := build(t, `
+		#places {
+			::a[type='city'] { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 50; }
+			::b[type='city'], ::b[type='town'] { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-repeat-distance: 50; text-dx: 4; }
+		}
+	`, "places")
+	// ::b draws towns, which ::a does not.
+	layerByID(t, style, "places::b::text")
+}
+
+func TestNonSimplePlacementTypeIsReported(t *testing.T) {
+	m, _ := build(t, `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-placement-type: list; }`, "places")
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["text-placement-type"]`)
 }

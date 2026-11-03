@@ -20,6 +20,8 @@ var symbolizerPrefixes = []string{"line-", "line-pattern-", "polygon-", "polygon
 type propConv struct {
 	target string
 	layout bool
+	// always properties are written even if no rule sets them, with def.
+	always bool
 	// zoomOnly properties take no data expressions in MapLibre; where the
 	// value differs between features, the fallback value is used for all.
 	zoomOnly bool
@@ -37,8 +39,15 @@ type symConverter struct {
 	draws   func(p *mss.Properties) bool
 	props   map[string]propConv
 	omitted map[string]string // property -> reason, for the report
+	// handled are properties converted by props of other names.
+	handled []string
+	// approximate returns the reason for the report if a property of a
+	// rule is converted with a visible difference.
+	approximate map[string]func(p *mss.Properties) (string, bool)
 	// constPaint is added to the paint of every layer the symbolizer draws.
 	constPaint map[string]interface{}
+	// constLayout is added to the layout of every layer the symbolizer draws.
+	constLayout map[string]interface{}
 	// approximated, if set, is reported for every rule that draws.
 	approximated string
 	// underlay, if set, converts an extra layer drawn below this one, with
@@ -167,6 +176,7 @@ var converters = map[string]symConverter{
 		},
 		blend: &blendProps{compOp: "line-comp-op", color: "line-color", opacity: "line-opacity"},
 	},
+	"text-": textConverter,
 	"raster-": {
 		layerType: "raster",
 		draws: func(p *mss.Properties) bool {
@@ -324,6 +334,18 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 		}
 		var filterEntries []caseEntry
 		propEntries := map[string][]caseEntry{}
+		// Text merged into an earlier attachment is drawn there.
+		merged := sym.Name == "text-" && sym.Instance == ""
+		if merged && g.mergedZooms[zm] {
+			zooms = append(zooms, zoomValues{zoom: z, filter: false})
+			continue
+		}
+		var passRules [][]validRule
+		for _, pass := range g.passes {
+			if merged && pass.mergedZooms[zm] {
+				passRules = append(passRules, validRules(pass, zm))
+			}
+		}
 		for i, r := range g.rules {
 			if !r.Zoom.ValidFor(zm) {
 				continue
@@ -338,6 +360,15 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 					v, ok := pc.value(r.Properties)
 					if bv, isBlended := blended[name]; isBlended {
 						v, ok = bv, true
+					}
+					if pc.target == "text-variable-anchor-offset" && len(passRules) > 0 && !isLinePlacement(r.Properties) {
+						var passes []*mss.Properties
+						for _, pr := range passRules {
+							if pp, found := ruleFor(pr, cond); found {
+								passes = append(passes, pp)
+							}
+						}
+						v, ok = mergedAnchors(r.Properties, passes), true
 					}
 					if ok {
 						isSet[name] = true
@@ -412,10 +443,10 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if !isSet[name] {
+		pc := conv.props[name]
+		if !isSet[name] && !pc.always {
 			continue
 		}
-		pc := conv.props[name]
 		var values []interface{}
 		for _, zv := range inRange {
 			if zv.props == nil {
@@ -439,6 +470,12 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 		}
 	}
 
+	for k, v := range conv.constLayout {
+		if sl.Layout == nil {
+			sl.Layout = map[string]interface{}{}
+		}
+		sl.Layout[k] = v
+	}
 	for k, v := range conv.constPaint {
 		if sl.Paint == nil {
 			sl.Paint = map[string]interface{}{}
@@ -480,6 +517,7 @@ func fillGaps(values []interface{}) {
 // caseExpr returns the expression for "the value of the first entry whose
 // condition matches, else fallback", simplified.
 func caseExpr(entries []caseEntry, fallback interface{}) interface{} {
+	entries = withoutShadowed(entries)
 	for i, e := range entries {
 		if e.cond == true {
 			entries, fallback = entries[:i], e.value
@@ -495,6 +533,16 @@ func caseExpr(entries []caseEntry, fallback interface{}) interface{} {
 	if expr, ok := matchExpr(entries, fallback); ok {
 		return expr
 	}
+	plain := plainCaseExpr(entries, fallback)
+	if expr, ok := hoistedMatch(entries, fallback); ok && len(mustJSON(expr)) < len(mustJSON(plain)) {
+		return expr
+	}
+	return plain
+}
+
+// plainCaseExpr returns entries as a case chain, or as any if all values
+// are true and the fallback is false.
+func plainCaseExpr(entries []caseEntry, fallback interface{}) interface{} {
 	if fallback == false {
 		allTrue := true
 		for _, e := range entries {
@@ -708,6 +756,7 @@ func (m *Map) condition(layerID, attachment string, filters []mss.Filter) interf
 			conds = append(conds, c)
 		}
 	}
+	conds = uniqueExprs(conds)
 	switch len(conds) {
 	case 0:
 		return true
@@ -778,4 +827,180 @@ func (m *Map) filterExpr(layerID, attachment string, f mss.Filter) interface{} {
 		[]interface{}{"==", []interface{}{"typeof", get}, typ},
 		[]interface{}{op, get, f.Value},
 	}
+}
+
+func (c symConverter) handles(property string) bool {
+	for _, h := range c.handled {
+		if h == property {
+			return true
+		}
+	}
+	return false
+}
+
+// uniqueExprs drops repeated expressions, e.g. the type checks of two
+// comparisons on one field.
+func uniqueExprs(exprs []interface{}) []interface{} {
+	var result []interface{}
+	seen := map[string]bool{}
+	for _, e := range exprs {
+		k := string(mustJSON(e))
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+func mustJSON(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// hoistedMatch rewrites entries as a match on the field that most of their
+// conditions compare for equality with a literal. Each branch keeps, in
+// order, the entries that can match a feature with that value, without the
+// comparison; the fallback branch keeps the entries that do not compare the
+// field. The result keeps the first-match semantics of the case chain and is
+// much shorter for CartoCSS cross products like type × area.
+func hoistedMatch(entries []caseEntry, fallback interface{}) (interface{}, bool) {
+	conjunctsOf := func(cond interface{}) []interface{} {
+		if c, ok := cond.([]interface{}); ok && len(c) > 0 && c[0] == "all" {
+			return c[1:]
+		}
+		return []interface{}{cond}
+	}
+	counts := map[string]int{}
+	var fields []string
+	for _, e := range entries {
+		seen := map[string]bool{}
+		for _, c := range conjunctsOf(e.cond) {
+			if f, _, ok := fieldEquals(c); ok && !seen[f] {
+				seen[f] = true
+				if counts[f] == 0 {
+					fields = append(fields, f)
+				}
+				counts[f]++
+			}
+		}
+	}
+	field := ""
+	for _, f := range fields {
+		if counts[f] >= 2 && (field == "" || counts[f] > counts[field]) {
+			field = f
+		}
+	}
+	if field == "" {
+		return nil, false
+	}
+
+	type split struct {
+		label interface{} // nil: no comparison on field
+		never bool        // compares field with two different labels
+		rest  interface{}
+	}
+	splits := make([]split, len(entries))
+	var labels []interface{}
+	seenLabel := map[interface{}]bool{}
+	for i, e := range entries {
+		var others []interface{}
+		for _, c := range conjunctsOf(e.cond) {
+			f, lit, ok := fieldEquals(c)
+			if !ok || f != field {
+				others = append(others, c)
+				continue
+			}
+			if splits[i].label != nil && !equal(splits[i].label, lit) {
+				splits[i].never = true
+			}
+			splits[i].label = lit
+		}
+		if l := splits[i].label; l != nil && !splits[i].never {
+			if len(labels) > 0 && isStringLabel(l) != isStringLabel(labels[0]) {
+				return nil, false // MapLibre's match needs labels of one type
+			}
+			if !seenLabel[l] {
+				seenLabel[l] = true
+				labels = append(labels, l)
+			}
+		}
+		switch len(others) {
+		case 0:
+			splits[i].rest = true
+		case 1:
+			splits[i].rest = others[0]
+		default:
+			splits[i].rest = append([]interface{}{"all"}, others...)
+		}
+	}
+	if len(labels) < 2 {
+		return nil, false
+	}
+
+	branch := func(label interface{}) interface{} {
+		var sub []caseEntry
+		for i, sp := range splits {
+			if sp.never || (sp.label != nil && !equal(sp.label, label)) {
+				continue
+			}
+			sub = append(sub, caseEntry{sp.rest, entries[i].value})
+		}
+		return caseExpr(sub, fallback)
+	}
+	def := branch(nil)
+
+	type group struct {
+		labels []interface{}
+		value  interface{}
+	}
+	var groups []*group
+	for _, l := range labels {
+		v := branch(l)
+		if equal(v, def) {
+			continue
+		}
+		var g *group
+		for _, gg := range groups {
+			if equal(gg.value, v) {
+				g = gg
+				break
+			}
+		}
+		if g == nil {
+			g = &group{value: v}
+			groups = append(groups, g)
+		}
+		g.labels = append(g.labels, l)
+	}
+	if len(groups) == 0 {
+		return def, true
+	}
+	match := []interface{}{"match", []interface{}{"get", field}}
+	for _, g := range groups {
+		if len(g.labels) == 1 {
+			match = append(match, g.labels[0], g.value)
+		} else {
+			match = append(match, g.labels, g.value)
+		}
+	}
+	return append(match, def), true
+}
+
+// withoutShadowed drops entries whose condition an earlier entry already
+// has: they never decide.
+func withoutShadowed(entries []caseEntry) []caseEntry {
+	var result []caseEntry
+	seen := map[string]bool{}
+	for _, e := range entries {
+		k := string(mustJSON(e.cond))
+		if !seen[k] {
+			seen[k] = true
+			result = append(result, e)
+		}
+	}
+	return result
 }

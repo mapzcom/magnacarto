@@ -191,11 +191,14 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 	fields := map[string]bool{}
 	minZoom, maxZoom := -1, -1
 
-	for _, group := range groupByAttachment(rules) {
-		m.noteUnsupported(l.ID, group)
-		for _, r := range group.rules {
-			group.conds = append(group.conds, m.condition(l.ID, group.name, r.Filters))
+	groups := groupByAttachment(rules)
+	for i := range groups {
+		m.noteUnsupported(l.ID, groups[i])
+		for _, r := range groups[i].rules {
+			groups[i].conds = append(groups[i].conds, m.condition(l.ID, groups[i].name, r.Filters))
 		}
+	}
+	for _, group := range m.mergePasses(l.ID, groups) {
 		for _, sym := range symbolizersOf(group.rules) {
 			for _, part := range symbolizerParts(sym.Name) {
 				sl, ok := m.convertSymbolizer(l.ID, group, sym, part.conv, part.suffix)
@@ -206,9 +209,13 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 				if sl.Type != "raster" {
 					sl.SourceLayer = sourceLayer
 				}
-				out := []Layer{sl.Layer}
-				if m.opts.Rewrite != nil {
-					out = m.opts.Rewrite(l, sl.Layer)
+				var out []Layer
+				for _, part := range splitLineLabels(sl.Layer) {
+					if m.opts.Rewrite != nil {
+						out = append(out, m.opts.Rewrite(l, part)...)
+					} else {
+						out = append(out, part)
+					}
 				}
 				if len(out) == 0 {
 					continue
@@ -241,6 +248,11 @@ type attachmentGroup struct {
 	name  string
 	rules []mss.Rule
 	conds []interface{} // MapLibre condition per rule
+	// passes are following attachments whose text is merged into this
+	// one, see mergePasses; mergedZooms are the Mapnik zoom levels at which
+	// the text of such a pass is merged.
+	passes      []attachmentGroup
+	mergedZooms map[int]bool
 }
 
 // groupByAttachment groups rules by attachment in order of first occurrence,
@@ -315,7 +327,12 @@ func (m *Map) noteUnsupported(layer string, group attachmentGroup) {
 				if !strings.HasPrefix(k, p.Name) || isOtherPrefix(k, p.Name) {
 					continue
 				}
-				if _, ok := conv.props[k]; ok {
+				if approx, ok := conv.approximate[k]; ok {
+					if detail, ok := approx(r.Properties); ok {
+						m.note(layer, group.name, instanceName(p.Instance, k), Approximated, detail)
+					}
+				}
+				if _, ok := conv.props[k]; ok || conv.handles(k) {
 					continue
 				}
 				if conv.blend != nil && k == conv.blend.compOp {
@@ -388,7 +405,20 @@ func (m *Map) Write(w io.Writer) error {
 			Paint: map[string]interface{}{"background-color": fmtColor(*m.bgColor)},
 		})
 	}
-	s.Layers = append(s.Layers, m.layers...)
+	// MapLibre places the symbols of the top layer first, Mapnik those of
+	// the first layer: symbol layers come last, in reverse order, to keep
+	// Mapnik's priorities and collision blockers.
+	var symbols []Layer
+	for _, l := range m.layers {
+		if l.Type == "symbol" {
+			symbols = append(symbols, l)
+		} else {
+			s.Layers = append(s.Layers, l)
+		}
+	}
+	for i := len(symbols) - 1; i >= 0; i-- {
+		s.Layers = append(s.Layers, symbols[i])
+	}
 	return writeStyle(w, s)
 }
 
