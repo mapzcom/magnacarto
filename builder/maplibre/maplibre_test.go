@@ -191,7 +191,7 @@ func TestDasharrayInLineWidths(t *testing.T) {
 
 	paint := layerByID(t, style, "roads::::line")["paint"].(map[string]interface{})
 	assertJSON(t, "line-dasharray", paint["line-dasharray"],
-		`["case", ["==", ["get", "tunnel"], 0], ["literal", [1, 0]], ["literal", [2, 1]]]`)
+		`["case", ["any", ["==", ["get", "tunnel"], 0], ["==", ["get", "tunnel"], false]], ["literal", [1, 0]], ["literal", [2, 1]]]`)
 }
 
 // Rules that differ only in the value of one field, the usual
@@ -206,10 +206,10 @@ func TestMatchOnCommonField(t *testing.T) {
 	`, "roads")
 
 	l := layerByID(t, style, "roads::::line")
-	assertJSON(t, "filter", l["filter"], `["all", ["!=", ["get", "tunnel"], 1],
+	assertJSON(t, "filter", l["filter"], `["all", ["!=", ["get", "tunnel"], 1], ["!=", ["get", "tunnel"], true],
 		["match", ["get", "type"], ["tertiary", "secondary", "primary"], true, false]]`)
 	assertJSON(t, "line-width", l["paint"].(map[string]interface{})["line-width"],
-		`["case", ["!=", ["get", "tunnel"], 1],
+		`["case", ["all", ["!=", ["get", "tunnel"], 1], ["!=", ["get", "tunnel"], true]],
 			["match", ["get", "type"], ["tertiary", "secondary"], 2, 3], 3]`)
 }
 
@@ -220,7 +220,7 @@ func TestFilterOperators(t *testing.T) {
 
 	l := layerByID(t, style, "water::::polygon")
 	assertJSON(t, "filter", l["filter"], `["all",
-		["all", ["==", ["typeof", ["get", "area"]], "number"], [">", ["get", "area"], 40000]],
+		["==", ["typeof", ["get", "area"]], "number"], [">", ["get", "area"], 40000],
 		["!=", ["get", "type"], "marina"]]`)
 }
 
@@ -281,4 +281,18 @@ func TestUnsupportedFilterCountedOncePerRule(t *testing.T) {
 	if !found {
 		t.Errorf("missing note for the regex filter: %+v", m.Notes())
 	}
+}
+
+// Mapnik compares booleans as 0 and 1, e.g. [tunnel=1] matches a boolean
+// tunnel attribute that is true.
+func TestBooleanAttributesCompareAsZeroAndOne(t *testing.T) {
+	_, style := build(t, `
+		#tunnels[tunnel=1] { line-width: 2; }
+		#bridges[bridge!=0] { line-width: 3; }
+	`, "tunnels", "bridges")
+
+	assertJSON(t, "tunnels", layerByID(t, style, "tunnels::::line")["filter"],
+		`["any", ["==", ["get", "tunnel"], 1], ["==", ["get", "tunnel"], true]]`)
+	assertJSON(t, "bridges", layerByID(t, style, "bridges::::line")["filter"],
+		`["all", ["!=", ["get", "bridge"], 0], ["!=", ["get", "bridge"], false]]`)
 }

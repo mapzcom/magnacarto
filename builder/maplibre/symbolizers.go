@@ -513,7 +513,12 @@ func collectFields(v interface{}, fields map[string]bool) {
 func (m *Map) condition(layerID, attachment string, filters []mss.Filter) interface{} {
 	var conds []interface{}
 	for _, f := range filters {
-		conds = append(conds, m.filterExpr(layerID, attachment, f))
+		c := m.filterExpr(layerID, attachment, f)
+		if all, ok := c.([]interface{}); ok && len(all) > 0 && all[0] == "all" {
+			conds = append(conds, all[1:]...)
+		} else {
+			conds = append(conds, c)
+		}
 	}
 	switch len(conds) {
 	case 0:
@@ -523,6 +528,18 @@ func (m *Map) condition(layerID, attachment string, filters []mss.Filter) interf
 	default:
 		return append([]interface{}{"all"}, conds...)
 	}
+}
+
+// boolEquivalent returns the boolean that Mapnik considers equal to the
+// numbers 0 and 1.
+func boolEquivalent(v interface{}) (bool, bool) {
+	switch v {
+	case 0.0:
+		return false, true
+	case 1.0:
+		return true, true
+	}
+	return false, false
 }
 
 var compOps = map[mss.CompOp]string{
@@ -553,6 +570,14 @@ func (m *Map) filterExpr(layerID, attachment string, f mss.Filter) interface{} {
 	}
 	switch f.CompOp {
 	case mss.EQ, mss.NEQ:
+		// Mapnik compares booleans as 0 and 1; MapLibre's true != 1.
+		if b, ok := boolEquivalent(f.Value); ok {
+			join := "any"
+			if f.CompOp == mss.NEQ {
+				join = "all"
+			}
+			return []interface{}{join, []interface{}{op, get, f.Value}, []interface{}{op, get, b}}
+		}
 		return []interface{}{op, get, f.Value}
 	}
 	// Mapnik's ordering comparisons are false for missing values and other
