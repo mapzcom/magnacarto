@@ -1,0 +1,568 @@
+package maplibre
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+
+	"github.com/omniscale/magnacarto/mss"
+)
+
+// symbolizerPrefixes are all CartoCSS symbolizer prefixes, as in the Mapnik
+// builder. Prefixes without a converter are reported as omitted.
+var symbolizerPrefixes = []string{"line-", "line-pattern-", "polygon-", "polygon-pattern-", "text-", "shield-", "marker-", "point-", "building-", "raster-", "dot-"}
+
+// propConv converts one CartoCSS property to one MapLibre property.
+type propConv struct {
+	target string
+	layout bool
+	// value returns the MapLibre value for a rule, or false if the rule does
+	// not set the property.
+	value func(p *mss.Properties) (interface{}, bool)
+	// def is the MapLibre value for Mapnik's default, used for rules that
+	// do not set the property while others do.
+	def interface{}
+}
+
+type symConverter struct {
+	layerType string
+	// draws reports whether Mapnik creates the symbolizer for a rule.
+	draws   func(p *mss.Properties) bool
+	props   map[string]propConv
+	omitted map[string]string // property -> reason, for the report
+}
+
+var converters = map[string]symConverter{
+	"polygon-": {
+		layerType: "fill",
+		draws: func(p *mss.Properties) bool {
+			_, ok := p.GetColor("polygon-fill")
+			return ok
+		},
+		props: map[string]propConv{
+			"polygon-fill":    {target: "fill-color", value: colorValue("polygon-fill")},
+			"polygon-opacity": {target: "fill-opacity", value: floatValue("polygon-opacity", 1), def: 1.0},
+		},
+		omitted: map[string]string{
+			"polygon-gamma":   "MapLibre antialiases fill edges itself (fill-antialias)",
+			"polygon-comp-op": "MapLibre has no compositing operations",
+		},
+	},
+	"line-": {
+		layerType: "line",
+		draws: func(p *mss.Properties) bool {
+			w, ok := p.GetFloat("line-width")
+			return ok && w != 0
+		},
+		props: map[string]propConv{
+			"line-width":   {target: "line-width", value: floatValue("line-width", 1)},
+			"line-color":   {target: "line-color", value: colorValue("line-color"), def: "#000000"},
+			"line-opacity": {target: "line-opacity", value: floatValue("line-opacity", 1), def: 1.0},
+			// Mapnik offsets to the left for positive values, MapLibre to the right.
+			"line-offset":     {target: "line-offset", value: floatValue("line-offset", -1), def: 0.0},
+			"line-dasharray":  {target: "line-dasharray", value: dashValue, def: literal([]float64{1, 0})},
+			"line-cap":        {target: "line-cap", layout: true, value: stringValue("line-cap"), def: "butt"},
+			"line-join":       {target: "line-join", layout: true, value: stringValue("line-join"), def: "miter"},
+			"line-miterlimit": {target: "line-miter-limit", layout: true, value: floatValue("line-miterlimit", 1), def: 4.0},
+		},
+		omitted: map[string]string{
+			"line-gamma":   "MapLibre antialiases lines itself",
+			"line-comp-op": "MapLibre has no compositing operations",
+		},
+	},
+}
+
+func colorValue(name string) func(p *mss.Properties) (interface{}, bool) {
+	return func(p *mss.Properties) (interface{}, bool) {
+		c, ok := p.GetColor(name)
+		if !ok {
+			return nil, false
+		}
+		return fmtColor(c), true
+	}
+}
+
+func floatValue(name string, factor float64) func(p *mss.Properties) (interface{}, bool) {
+	return func(p *mss.Properties) (interface{}, bool) {
+		v, ok := p.GetFloat(name)
+		return v * factor, ok
+	}
+}
+
+func stringValue(name string) func(p *mss.Properties) (interface{}, bool) {
+	return func(p *mss.Properties) (interface{}, bool) {
+		v, ok := p.GetString(name)
+		return v, ok
+	}
+}
+
+// dashValue converts Mapnik's dash lengths in pixels to MapLibre's in line
+// widths.
+func dashValue(p *mss.Properties) (interface{}, bool) {
+	dashes, ok := p.GetFloatList("line-dasharray")
+	if !ok || len(dashes) == 0 {
+		return nil, false
+	}
+	width, _ := p.GetFloat("line-width")
+	if len(dashes)%2 == 1 {
+		// SVG semantics, as in Mapnik: an odd list is repeated.
+		dashes = append(dashes, dashes...)
+	}
+	result := make([]float64, len(dashes))
+	for i, d := range dashes {
+		result[i] = d / width
+	}
+	return literal(result), true
+}
+
+func literal(v interface{}) interface{} {
+	return []interface{}{"literal", v}
+}
+
+type convertedLayer struct {
+	styleLayer
+	first, last int // MapLibre zoom range, inclusive
+	fields      []string
+}
+
+type caseEntry struct {
+	cond  interface{}
+	value interface{}
+}
+
+// convertSymbolizer converts one symbolizer of an attachment to a MapLibre
+// layer. It returns false if the symbolizer draws nothing.
+func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefix) (convertedLayer, bool) {
+	conv, ok := converters[sym.Name]
+	if !ok {
+		return convertedLayer{}, false
+	}
+
+	type zoomValues struct {
+		zoom   int
+		filter interface{}
+		props  map[string]interface{} // nil if nothing is drawn
+	}
+	var zooms []zoomValues
+	isSet := map[string]bool{}
+	first, last, lastMapnik := -1, -1, -1
+
+	for zm := 0; zm <= m.opts.MaxMapnikZoom; zm++ {
+		z := zm + m.opts.ZoomOffset
+		if z < 0 {
+			continue
+		}
+		var filterEntries []caseEntry
+		propEntries := map[string][]caseEntry{}
+		for i, r := range g.rules {
+			if !r.Zoom.ValidFor(zm) {
+				continue
+			}
+			r.Properties.SetDefaultInstance(sym.Instance)
+			cond := g.conds[i]
+			draws := conv.draws(r.Properties)
+			filterEntries = append(filterEntries, caseEntry{cond, draws})
+			if draws {
+				for name, pc := range conv.props {
+					v, ok := pc.value(r.Properties)
+					if ok {
+						isSet[name] = true
+					} else {
+						v = pc.def
+					}
+					propEntries[name] = append(propEntries[name], caseEntry{cond, v})
+				}
+			}
+			r.Properties.SetDefaultInstance("")
+		}
+
+		zv := zoomValues{zoom: z, filter: caseExpr(filterEntries, false)}
+		if zv.filter != false {
+			if first < 0 {
+				first = z
+			}
+			last, lastMapnik = z, zm
+			zv.props = map[string]interface{}{}
+			for name, entries := range propEntries {
+				n := len(entries)
+				zv.props[name] = caseExpr(entries[:n-1], entries[n-1].value)
+			}
+		}
+		zooms = append(zooms, zv)
+	}
+	if first < 0 {
+		return convertedLayer{}, false
+	}
+
+	// Only the zoom levels in which the layer draws are relevant.
+	var inRange []zoomValues
+	for _, zv := range zooms {
+		if zv.zoom >= first && zv.zoom <= last {
+			inRange = append(inRange, zv)
+		}
+	}
+
+	id := layerID + "::" + g.name + "::" + instanceName(sym.Instance, strings.TrimSuffix(sym.Name, "-"))
+	sl := convertedLayer{
+		styleLayer: styleLayer{ID: id, Type: conv.layerType},
+		first:      first,
+		last:       last,
+	}
+	if first > 0 {
+		sl.MinZoom = intPtr(first)
+	}
+	if lastMapnik < m.opts.MaxMapnikZoom {
+		sl.MaxZoom = intPtr(last + 1)
+	}
+
+	var filters []interface{}
+	for _, zv := range inRange {
+		filters = append(filters, zv.filter)
+	}
+	if f := stepExpr(first, filters); f != true {
+		sl.Filter = f
+	}
+
+	names := make([]string, 0, len(conv.props))
+	for name := range conv.props {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !isSet[name] {
+			continue
+		}
+		pc := conv.props[name]
+		var values []interface{}
+		for _, zv := range inRange {
+			if zv.props == nil {
+				values = append(values, nil)
+			} else {
+				values = append(values, zv.props[name])
+			}
+		}
+		fillGaps(values)
+		v := stepExpr(first, values)
+		if pc.layout {
+			if sl.Layout == nil {
+				sl.Layout = map[string]interface{}{}
+			}
+			sl.Layout[pc.target] = v
+		} else {
+			if sl.Paint == nil {
+				sl.Paint = map[string]interface{}{}
+			}
+			sl.Paint[pc.target] = v
+		}
+	}
+
+	fields := map[string]bool{}
+	collectFields(sl.Filter, fields)
+	collectFields(sl.Paint, fields)
+	collectFields(sl.Layout, fields)
+	for f := range fields {
+		sl.fields = append(sl.fields, f)
+	}
+	sort.Strings(sl.fields)
+	return sl, true
+}
+
+// fillGaps replaces nil values (zoom levels in which nothing is drawn) with
+// the previous value, or the next one at the start, to keep steps short.
+func fillGaps(values []interface{}) {
+	var prev interface{}
+	for i, v := range values {
+		if v == nil {
+			values[i] = prev
+		} else {
+			prev = v
+		}
+	}
+	for i := len(values) - 1; i >= 0; i-- {
+		if values[i] == nil {
+			values[i] = prev
+		} else {
+			prev = values[i]
+		}
+	}
+}
+
+// caseExpr returns the expression for "the value of the first entry whose
+// condition matches, else fallback", simplified.
+func caseExpr(entries []caseEntry, fallback interface{}) interface{} {
+	for i, e := range entries {
+		if e.cond == true {
+			entries, fallback = entries[:i], e.value
+			break
+		}
+	}
+	for len(entries) > 0 && equal(entries[len(entries)-1].value, fallback) {
+		entries = entries[:len(entries)-1]
+	}
+	if len(entries) == 0 {
+		return fallback
+	}
+	if expr, ok := matchExpr(entries, fallback); ok {
+		return expr
+	}
+	if fallback == false {
+		allTrue := true
+		for _, e := range entries {
+			if e.value != true {
+				allTrue = false
+				break
+			}
+		}
+		if allTrue {
+			if len(entries) == 1 {
+				return entries[0].cond
+			}
+			expr := []interface{}{"any"}
+			for _, e := range entries {
+				expr = append(expr, e.cond)
+			}
+			return expr
+		}
+	}
+	expr := []interface{}{"case"}
+	for _, e := range entries {
+		expr = append(expr, e.cond, e.value)
+	}
+	return append(expr, fallback)
+}
+
+// matchExpr rewrites entries whose conditions share all conjuncts but one
+// ["==", ["get", field], literal] with the same field as a match on that
+// field, which is exact and much shorter than the case chain.
+func matchExpr(entries []caseEntry, fallback interface{}) (interface{}, bool) {
+	if len(entries) < 2 {
+		return nil, false
+	}
+	conjuncts := make([][]interface{}, len(entries))
+	for i, e := range entries {
+		if c, ok := e.cond.([]interface{}); ok && len(c) > 0 && c[0] == "all" {
+			conjuncts[i] = c[1:]
+		} else {
+			conjuncts[i] = []interface{}{e.cond}
+		}
+	}
+
+candidates:
+	for _, c := range conjuncts[0] {
+		field, _, ok := fieldEquals(c)
+		if !ok {
+			continue
+		}
+		var rest []interface{}
+		labels := make([]interface{}, len(entries))
+		for i := range entries {
+			var others []interface{}
+			found := false
+			for _, cc := range conjuncts[i] {
+				if f, lit, ok := fieldEquals(cc); ok && f == field && !found {
+					labels[i] = lit
+					found = true
+				} else {
+					others = append(others, cc)
+				}
+			}
+			if !found {
+				continue candidates
+			}
+			if i == 0 {
+				rest = others
+			} else if !equal(others, rest) {
+				continue candidates
+			}
+			if _, isString := labels[i].(string); isString != isStringLabel(labels[0]) {
+				continue candidates
+			}
+		}
+
+		// Group the labels by value; the first entry with a label wins.
+		type branch struct {
+			labels []interface{}
+			value  interface{}
+		}
+		var branches []*branch
+		seenLabel := map[interface{}]bool{}
+		for i, e := range entries {
+			if seenLabel[labels[i]] {
+				continue
+			}
+			seenLabel[labels[i]] = true
+			var b *branch
+			for _, bb := range branches {
+				if equal(bb.value, e.value) {
+					b = bb
+					break
+				}
+			}
+			if b == nil {
+				b = &branch{value: e.value}
+				branches = append(branches, b)
+			}
+			b.labels = append(b.labels, labels[i])
+		}
+
+		allTrue := fallback == false && len(branches) == 1 && branches[0].value == true
+		match := []interface{}{"match", []interface{}{"get", field}}
+		for _, b := range branches {
+			if len(b.labels) == 1 {
+				match = append(match, b.labels[0], b.value)
+			} else {
+				match = append(match, b.labels, b.value)
+			}
+		}
+		match = append(match, fallback)
+
+		switch {
+		case len(rest) == 0:
+			return match, true
+		case allTrue:
+			return append(append([]interface{}{"all"}, rest...), match), true
+		case len(rest) == 1:
+			return []interface{}{"case", rest[0], match, fallback}, true
+		default:
+			return []interface{}{"case", append([]interface{}{"all"}, rest...), match, fallback}, true
+		}
+	}
+	return nil, false
+}
+
+func isStringLabel(v interface{}) bool {
+	_, ok := v.(string)
+	return ok
+}
+
+// fieldEquals reports whether c is ["==", ["get", field], literal] with a
+// string or number literal.
+func fieldEquals(c interface{}) (string, interface{}, bool) {
+	expr, ok := c.([]interface{})
+	if !ok || len(expr) != 3 || expr[0] != "==" {
+		return "", nil, false
+	}
+	get, ok := expr[1].([]interface{})
+	if !ok || len(get) != 2 || get[0] != "get" {
+		return "", nil, false
+	}
+	field, ok := get[1].(string)
+	if !ok {
+		return "", nil, false
+	}
+	switch v := expr[2].(type) {
+	case string:
+		return field, v, true
+	case float64:
+		// MapLibre accepts only integers as numeric match labels.
+		if v == math.Trunc(v) && math.Abs(v) < 1<<53 {
+			return field, v, true
+		}
+	}
+	return "", nil, false
+}
+
+// stepExpr combines the values of consecutive zoom levels starting at first
+// into a step expression over the zoom.
+func stepExpr(first int, values []interface{}) interface{} {
+	expr := []interface{}{"step", []interface{}{"zoom"}, values[0]}
+	prev := values[0]
+	for i, v := range values[1:] {
+		if !equal(v, prev) {
+			expr = append(expr, first+i+1, v)
+			prev = v
+		}
+	}
+	if len(expr) == 3 {
+		return values[0]
+	}
+	return expr
+}
+
+func equal(a, b interface{}) bool {
+	ja, err1 := json.Marshal(a)
+	jb, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && string(ja) == string(jb)
+}
+
+func intPtr(i int) *int { return &i }
+
+// collectFields adds the names of all ["get", name] expressions in v.
+func collectFields(v interface{}, fields map[string]bool) {
+	switch v := v.(type) {
+	case []interface{}:
+		if len(v) == 2 && v[0] == "get" {
+			if name, ok := v[1].(string); ok {
+				fields[name] = true
+				return
+			}
+		}
+		for _, e := range v {
+			collectFields(e, fields)
+		}
+	case map[string]interface{}:
+		for _, e := range v {
+			collectFields(e, fields)
+		}
+	}
+}
+
+// condition converts the filters of a rule to a MapLibre expression.
+func (m *Map) condition(layerID, attachment string, filters []mss.Filter) interface{} {
+	var conds []interface{}
+	for _, f := range filters {
+		conds = append(conds, m.filterExpr(layerID, attachment, f))
+	}
+	switch len(conds) {
+	case 0:
+		return true
+	case 1:
+		return conds[0]
+	default:
+		return append([]interface{}{"all"}, conds...)
+	}
+}
+
+var compOps = map[mss.CompOp]string{
+	mss.EQ: "==", mss.NEQ: "!=", mss.GT: ">", mss.LT: "<", mss.GTE: ">=", mss.LTE: "<=",
+}
+
+func (m *Map) filterExpr(layerID, attachment string, f mss.Filter) interface{} {
+	field := strings.Trim(f.Field, `"`)
+	get := []interface{}{"get", field}
+
+	switch v := f.Value.(type) {
+	case mss.ModuloComparsion:
+		op, ok := compOps[v.CompOp]
+		if !ok {
+			break
+		}
+		return []interface{}{"all",
+			[]interface{}{"==", []interface{}{"typeof", get}, "number"},
+			[]interface{}{op, []interface{}{"%", get, v.Div}, v.Value},
+		}
+	}
+
+	op, ok := compOps[f.CompOp]
+	if !ok {
+		m.note(layerID, attachment, fmt.Sprintf("filter [%s %s ...]", field, f.CompOp), Approximated,
+			"filter operator not supported, the rule never matches")
+		return false
+	}
+	switch f.CompOp {
+	case mss.EQ, mss.NEQ:
+		return []interface{}{op, get, f.Value}
+	}
+	// Mapnik's ordering comparisons are false for missing values and other
+	// types, MapLibre's raise an error.
+	typ := "number"
+	if _, ok := f.Value.(string); ok {
+		typ = "string"
+	}
+	return []interface{}{"all",
+		[]interface{}{"==", []interface{}{"typeof", get}, typ},
+		[]interface{}{op, get, f.Value},
+	}
+}
