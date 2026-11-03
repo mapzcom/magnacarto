@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/omniscale/magnacarto/builder"
+	"github.com/omniscale/magnacarto/color"
 	"github.com/omniscale/magnacarto/mml"
 )
 
@@ -466,4 +467,49 @@ func TestPatternPathIsCleaned(t *testing.T) {
 	_, style := build(t, `#w { polygon-pattern-file: url(./Pattern/wetland.svg); }`, "w")
 	l := layerByID(t, style, "w::::polygon-pattern")
 	assertJSON(t, "paint", l["paint"], `{"fill-pattern": "Pattern/wetland"}`)
+}
+
+// Options.Blend replaces the colour and opacity of the rules with a
+// line-comp-op it approximates; other rules keep theirs, and the report says
+// approximated instead of omitted.
+func TestBlendApproximatesLineCompOp(t *testing.T) {
+	opts := testOptions()
+	opts.Blend = func(op string, c color.Color, opacity float64) (color.Color, float64, string, bool) {
+		if op != "darken" {
+			return c, opacity, "", false
+		}
+		return color.MustParse("#808080"), opacity * 0.5, "darken as opacity", true
+	}
+	m := New(opts)
+	mmlObj := &mml.MML{Layers: []mml.Layer{{ID: "roads", Active: true}}}
+	err := builder.BuildMapFromString(m, mmlObj, `
+		#roads {
+			[type='road'] { line-width: 1; line-color: #dddcdc; line-comp-op: darken; }
+			[type='track'] { line-width: 1; line-color: #dddcdc; line-comp-op: multiply; }
+			[type='primary'] { line-width: 2; line-color: #ff0000; }
+		}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := m.Write(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var style map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &style); err != nil {
+		t.Fatal(err)
+	}
+	paint := layerByID(t, style, "roads::::line")["paint"].(map[string]interface{})
+	// Rules of equal specificity come in reverse source order.
+	assertJSON(t, "line-color", paint["line-color"], `["match", ["get", "type"], "primary", "#ff0000", "track", "#dddcdc", "#808080"]`)
+	assertJSON(t, "line-opacity", paint["line-opacity"], `["match", ["get", "type"], ["primary", "track"], 1, 0.5]`)
+
+	var got []string
+	for _, n := range m.Notes() {
+		got = append(got, n.Property+" "+string(n.Kind)+" "+n.Detail)
+	}
+	want := "line-comp-op omitted MapLibre has no compositing operations|line-comp-op approximated darken as opacity"
+	if g := strings.Join(got, "|"); g != want {
+		t.Errorf("notes\n got  %s\n want %s", g, want)
+	}
 }

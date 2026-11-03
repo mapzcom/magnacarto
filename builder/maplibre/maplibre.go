@@ -22,6 +22,10 @@
 // lets the caller change converted layers, e.g. draw a raster from a DEM
 // source as "hillshade" or "color-relief".
 //
+// MapLibre has no compositing operations. Options.Blend lets the caller
+// approximate line-comp-op with a different colour and opacity, e.g. for a
+// known backdrop.
+//
 // Features without an equivalent in MapLibre are recorded as Notes rather
 // than silently dropped.
 package maplibre
@@ -57,6 +61,12 @@ type Options struct {
 	// layers (none to drop it), e.g. to draw a raster from a DEM source as
 	// "hillshade" or "color-relief". Use Map.AddNote to report the change.
 	Rewrite func(l mml.Layer, layer Layer) []Layer
+	// Blend, if set, approximates the compositing operation of a line
+	// (line-comp-op), which MapLibre does not have: it gets the operation
+	// and the colour and opacity of a rule and returns the colour and
+	// opacity to draw with instead, plus the reason for the report. With ok
+	// false the operation is omitted.
+	Blend func(op string, c color.Color, opacity float64) (blended color.Color, blendedOpacity float64, detail string, ok bool)
 	// Sources is written as the style's "sources".
 	Sources map[string]interface{}
 	// Name and Metadata are written to the style as is.
@@ -307,6 +317,12 @@ func (m *Map) noteUnsupported(layer string, group attachmentGroup) {
 				}
 				if _, ok := conv.props[k]; ok {
 					continue
+				}
+				if conv.blend != nil && k == conv.blend.compOp {
+					if _, detail, ok := m.blended(conv, r.Properties); ok {
+						m.note(layer, group.name, instanceName(p.Instance, k), Approximated, detail)
+						continue
+					}
 				}
 				detail := "no MapLibre equivalent"
 				if d, ok := conv.omitted[k]; ok {

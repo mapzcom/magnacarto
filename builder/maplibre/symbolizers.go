@@ -45,6 +45,40 @@ type symConverter struct {
 	// underlaySuffix appended to the layer ID.
 	underlay       *symConverter
 	underlaySuffix string
+	// blend, if set, names the properties Options.Blend works on.
+	blend *blendProps
+}
+
+// blendProps are the compositing operation of a symbolizer and the colour
+// and opacity properties that Options.Blend replaces.
+type blendProps struct {
+	compOp, color, opacity string
+}
+
+// blended returns the property values of a rule after Options.Blend, keyed
+// by CartoCSS property, and the reason for the report; false if the rule has
+// no compositing operation that Options.Blend approximates.
+func (m *Map) blended(conv symConverter, p *mss.Properties) (map[string]interface{}, string, bool) {
+	if conv.blend == nil || m.opts.Blend == nil {
+		return nil, "", false
+	}
+	op, ok := p.GetString(conv.blend.compOp)
+	if !ok {
+		return nil, "", false
+	}
+	c, ok := p.GetColor(conv.blend.color)
+	if !ok {
+		c = color.MustParse("#000000")
+	}
+	opacity, ok := p.GetFloat(conv.blend.opacity)
+	if !ok {
+		opacity = 1
+	}
+	bc, bo, detail, ok := m.opts.Blend(op, c, opacity)
+	if !ok {
+		return nil, "", false
+	}
+	return map[string]interface{}{conv.blend.color: fmtColor(bc), conv.blend.opacity: bo}, detail, true
 }
 
 // buildingOpacity is shared by the walls and the roof of a building.
@@ -131,6 +165,7 @@ var converters = map[string]symConverter{
 			"line-gamma":   "MapLibre antialiases lines itself",
 			"line-comp-op": "MapLibre has no compositing operations",
 		},
+		blend: &blendProps{compOp: "line-comp-op", color: "line-color", opacity: "line-opacity"},
 	},
 	"raster-": {
 		layerType: "raster",
@@ -290,8 +325,12 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 			draws := conv.draws(r.Properties)
 			filterEntries = append(filterEntries, caseEntry{cond, draws})
 			if draws {
+				blended, _, _ := m.blended(conv, r.Properties)
 				for name, pc := range conv.props {
 					v, ok := pc.value(r.Properties)
+					if bv, isBlended := blended[name]; isBlended {
+						v, ok = bv, true
+					}
 					if ok {
 						isSet[name] = true
 					} else {
