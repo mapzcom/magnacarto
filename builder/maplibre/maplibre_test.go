@@ -195,6 +195,15 @@ func TestDasharrayInLineWidths(t *testing.T) {
 		`["case", ["any", ["==", ["get", "tunnel"], 0], ["==", ["get", "tunnel"], false]], ["literal", [1, 0]], ["literal", [2, 1]]]`)
 }
 
+// MapLibre GL JS (6.15) draws nothing for a data-driven line-dasharray whose
+// pattern is shorter than one line width; repeating it looks the same.
+func TestShortDashPatternIsRepeated(t *testing.T) {
+	_, style := build(t, `#roads { line-width: 10; line-dasharray: 3, 1; }`, "roads")
+
+	paint := layerByID(t, style, "roads::::line")["paint"].(map[string]interface{})
+	assertJSON(t, "line-dasharray", paint["line-dasharray"], `["literal", [0.3, 0.1, 0.3, 0.1, 0.3, 0.1]]`)
+}
+
 // Rules that differ only in the value of one field, the usual
 // [tunnel!=1][type='...'] pattern, become a match expression.
 func TestMatchOnCommonField(t *testing.T) {

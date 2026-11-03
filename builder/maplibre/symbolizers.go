@@ -273,9 +273,17 @@ func dashValue(p *mss.Properties) (interface{}, bool) {
 		// SVG semantics, as in Mapnik: an odd list is repeated.
 		dashes = append(dashes, dashes...)
 	}
-	result := make([]float64, len(dashes))
+	pattern := make([]float64, len(dashes))
+	var total float64
 	for i, d := range dashes {
-		result[i] = d / width
+		pattern[i] = d / width
+		total += pattern[i]
+	}
+	// MapLibre GL JS (6.15) draws nothing for a data-driven dasharray
+	// shorter than one line width; the repeated pattern looks the same.
+	result := pattern
+	for sum := total; total > 0 && sum < 1; sum += total {
+		result = append(result, pattern...)
 	}
 	return literal(result), true
 }
