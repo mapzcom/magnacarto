@@ -296,3 +296,84 @@ func TestBooleanAttributesCompareAsZeroAndOne(t *testing.T) {
 	assertJSON(t, "bridges", layerByID(t, style, "bridges::::line")["filter"],
 		`["all", ["!=", ["get", "bridge"], 0], ["!=", ["get", "bridge"], false]]`)
 }
+
+func TestRasterLayer(t *testing.T) {
+	m, style := build(t, `
+		#relief[zoom>=1][zoom<=15] {
+			raster-scaling: bilinear;
+			raster-comp-op: multiply;
+			raster-mesh-size: 1;
+			[zoom=14] { raster-opacity: 0.5; }
+			[zoom=15] { raster-opacity: 0.2; }
+		}
+	`, "relief")
+
+	l := layerByID(t, style, "relief::::raster")
+	if l["type"] != "raster" || l["source"] != "src" {
+		t.Errorf("unexpected layer header %v", l)
+	}
+	if _, ok := l["source-layer"]; ok {
+		t.Errorf("raster layer with source-layer %v", l["source-layer"])
+	}
+	assertJSON(t, "zoom range", []interface{}{l["minzoom"], l["maxzoom"]}, `[null, 15]`)
+	assertJSON(t, "paint", l["paint"], `{
+		"raster-opacity": ["step", ["zoom"], 1, 13, 0.5, 14, 0.2],
+		"raster-resampling": "linear"
+	}`)
+
+	var omitted []string
+	for _, n := range m.Notes() {
+		if n.Kind == Omitted {
+			omitted = append(omitted, n.Property)
+		}
+	}
+	assertJSON(t, "omitted", omitted, `["raster-comp-op", "raster-mesh-size"]`)
+}
+
+func TestZeroRasterOpacityDoesNotDraw(t *testing.T) {
+	_, style := build(t, `#relief[zoom>=11] { raster-opacity: 0; }`, "relief")
+	if len(layers(style)) != 0 {
+		t.Errorf("expected no layers, got %v", layers(style))
+	}
+}
+
+func TestRewrite(t *testing.T) {
+	opts := testOptions()
+	var m *Map
+	opts.Rewrite = func(l mml.Layer, layer Layer) []Layer {
+		switch l.ID {
+		case "drop":
+			m.AddNote(l.ID, "", "raster-", Omitted, "dropped")
+			return nil
+		case "relief":
+			layer.Type = "hillshade"
+			layer.Paint = map[string]interface{}{"hillshade-exaggeration": 0.5}
+			return []Layer{layer}
+		}
+		return []Layer{layer}
+	}
+	m = New(opts)
+	mmlObj := &mml.MML{Layers: []mml.Layer{{ID: "relief", Active: true}, {ID: "drop", Active: true}}}
+	if err := builder.BuildMapFromString(m, mmlObj, `#relief, #drop { raster-opacity: 0.8; }`); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := m.Write(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var style map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &style); err != nil {
+		t.Fatal(err)
+	}
+	all := layers(style)
+	if len(all) != 1 || all[0]["type"] != "hillshade" {
+		t.Fatalf("expected one hillshade layer, got %v", all)
+	}
+	assertJSON(t, "paint", all[0]["paint"], `{"hillshade-exaggeration": 0.5}`)
+	if infos := m.Layers(); len(infos) != 1 || infos[0].Layer.ID != "relief" {
+		t.Errorf("expected layer info for relief only, got %+v", infos)
+	}
+	if n := m.Notes(); len(n) != 1 || n[0].Layer != "drop" || n[0].Detail != "dropped" {
+		t.Errorf("expected the note of the hook, got %+v", n)
+	}
+}

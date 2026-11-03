@@ -13,6 +13,10 @@
 // source-layer per MML layer. Layers returns what such a server needs to know:
 // the zoom range and the feature attributes each layer is read with.
 //
+// Raster symbolizers become "raster" layers without a source-layer. Options.Rewrite
+// lets the caller change converted layers, e.g. draw a raster from a DEM
+// source as "hillshade" or "color-relief".
+//
 // Features without an equivalent in MapLibre are recorded as Notes rather
 // than silently dropped.
 package maplibre
@@ -44,6 +48,10 @@ type Options struct {
 	MaxMapnikZoom int
 	// Source returns the MapLibre source ID and source-layer for an MML layer.
 	Source func(l mml.Layer) (source, sourceLayer string)
+	// Rewrite, if set, replaces each converted layer with the returned
+	// layers (none to drop it), e.g. to draw a raster from a DEM source as
+	// "hillshade" or "color-relief". Use Map.AddNote to report the change.
+	Rewrite func(l mml.Layer, layer Layer) []Layer
 	// Sources is written as the style's "sources".
 	Sources map[string]interface{}
 	// Name and Metadata are written to the style as is.
@@ -97,7 +105,7 @@ type LayerInfo struct {
 type Map struct {
 	opts      Options
 	bgColor   *color.Color
-	layers    []styleLayer
+	layers    []Layer
 	infos     []LayerInfo
 	notes     []Note
 	noteIndex map[noteKey]int
@@ -142,6 +150,12 @@ func (m *Map) UnsupportedFeatures() []string {
 	return result
 }
 
+// AddNote records an approximated or omitted feature of an MML layer; notes
+// with the same layer, attachment, property and kind are counted as one.
+func (m *Map) AddNote(layer, attachment, property string, kind NoteKind, detail string) {
+	m.note(layer, attachment, property, kind, detail)
+}
+
 func (m *Map) note(layer, attachment, property string, kind NoteKind, detail string) {
 	k := noteKey{layer, attachment, property, kind}
 	if i, ok := m.noteIndex[k]; ok {
@@ -173,8 +187,17 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 				continue
 			}
 			sl.Source = source
-			sl.SourceLayer = sourceLayer
-			m.layers = append(m.layers, sl.styleLayer)
+			if sl.Type != "raster" {
+				sl.SourceLayer = sourceLayer
+			}
+			out := []Layer{sl.Layer}
+			if m.opts.Rewrite != nil {
+				out = m.opts.Rewrite(l, sl.Layer)
+			}
+			if len(out) == 0 {
+				continue
+			}
+			m.layers = append(m.layers, out...)
 			for _, f := range sl.fields {
 				fields[f] = true
 			}
@@ -308,13 +331,13 @@ func (m *Map) Write(w io.Writer) error {
 		Sources:  m.opts.Sources,
 		Glyphs:   m.opts.Glyphs,
 		Sprite:   m.opts.Sprite,
-		Layers:   []styleLayer{},
+		Layers:   []Layer{},
 	}
 	if s.Sources == nil {
 		s.Sources = map[string]interface{}{}
 	}
 	if m.bgColor != nil {
-		s.Layers = append(s.Layers, styleLayer{
+		s.Layers = append(s.Layers, Layer{
 			ID:    "background",
 			Type:  "background",
 			Paint: map[string]interface{}{"background-color": fmtColor(*m.bgColor)},
@@ -337,7 +360,7 @@ func writeStyle(w io.Writer, s style) error {
 		exprs = append(exprs, b)
 		return fmt.Sprintf("\x00%d\x00", len(exprs)-1), nil
 	}
-	layers := make([]styleLayer, len(s.Layers))
+	layers := make([]Layer, len(s.Layers))
 	for i, l := range s.Layers {
 		var err error
 		if l.Filter != nil {
@@ -410,10 +433,11 @@ type style struct {
 	Sources  map[string]interface{} `json:"sources"`
 	Sprite   string                 `json:"sprite,omitempty"`
 	Glyphs   string                 `json:"glyphs,omitempty"`
-	Layers   []styleLayer           `json:"layers"`
+	Layers   []Layer                `json:"layers"`
 }
 
-type styleLayer struct {
+// Layer is a MapLibre style layer.
+type Layer struct {
 	ID          string                 `json:"id"`
 	Type        string                 `json:"type"`
 	Source      string                 `json:"source,omitempty"`

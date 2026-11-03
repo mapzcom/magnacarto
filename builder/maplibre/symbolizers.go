@@ -72,6 +72,40 @@ var converters = map[string]symConverter{
 			"line-comp-op": "MapLibre has no compositing operations",
 		},
 	},
+	"raster-": {
+		layerType: "raster",
+		draws: func(p *mss.Properties) bool {
+			o, ok := p.GetFloat("raster-opacity")
+			return !ok || o != 0
+		},
+		props: map[string]propConv{
+			"raster-opacity": {target: "raster-opacity", value: floatValue("raster-opacity", 1), def: 1.0},
+			// Mapnik's default is "near".
+			"raster-scaling": {target: "raster-resampling", value: scalingValue, def: "nearest"},
+		},
+		omitted: map[string]string{
+			"raster-comp-op":                 "MapLibre has no compositing operations",
+			"raster-mesh-size":               "MapLibre does not reproject rasters",
+			"raster-colorizer-default-mode":  "MapLibre has no raster colorizer",
+			"raster-colorizer-default-color": "MapLibre has no raster colorizer",
+			"raster-colorizer-stops":         "MapLibre has no raster colorizer",
+			"raster-colorizer-epsilon":       "MapLibre has no raster colorizer",
+			"raster-filter-factor":           "MapLibre chooses the downscaling filter itself",
+		},
+	},
+}
+
+// scalingValue maps Mapnik's raster-scaling to MapLibre's raster-resampling,
+// which knows only nearest and linear.
+func scalingValue(p *mss.Properties) (interface{}, bool) {
+	v, ok := p.GetString("raster-scaling")
+	if !ok {
+		return nil, false
+	}
+	if v == "near" {
+		return "nearest", true
+	}
+	return "linear", true
 }
 
 func colorValue(name string) func(p *mss.Properties) (interface{}, bool) {
@@ -122,7 +156,7 @@ func literal(v interface{}) interface{} {
 }
 
 type convertedLayer struct {
-	styleLayer
+	Layer
 	first, last int // MapLibre zoom range, inclusive
 	fields      []string
 }
@@ -206,9 +240,9 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 
 	id := layerID + "::" + g.name + "::" + instanceName(sym.Instance, strings.TrimSuffix(sym.Name, "-"))
 	sl := convertedLayer{
-		styleLayer: styleLayer{ID: id, Type: conv.layerType},
-		first:      first,
-		last:       last,
+		Layer: Layer{ID: id, Type: conv.layerType},
+		first: first,
+		last:  last,
 	}
 	if first > 0 {
 		sl.MinZoom = intPtr(first)
