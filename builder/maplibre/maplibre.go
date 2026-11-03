@@ -13,6 +13,11 @@
 // source-layer per MML layer. Layers returns what such a server needs to know:
 // the zoom range and the feature attributes each layer is read with.
 //
+// Pattern files are referenced as sprite images named by their path without
+// extension (url(Pattern/wetland.svg) → "Pattern/wetland"); Options.Sprite
+// must provide them. Buildings are drawn flat: walls below, the roof moved
+// up by the building height.
+//
 // Raster symbolizers become "raster" layers without a source-layer. Options.Rewrite
 // lets the caller change converted layers, e.g. draw a raster from a DEM
 // source as "hillshade" or "color-relief".
@@ -182,30 +187,32 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 			group.conds = append(group.conds, m.condition(l.ID, group.name, r.Filters))
 		}
 		for _, sym := range symbolizersOf(group.rules) {
-			sl, ok := m.convertSymbolizer(l.ID, group, sym)
-			if !ok {
-				continue
-			}
-			sl.Source = source
-			if sl.Type != "raster" {
-				sl.SourceLayer = sourceLayer
-			}
-			out := []Layer{sl.Layer}
-			if m.opts.Rewrite != nil {
-				out = m.opts.Rewrite(l, sl.Layer)
-			}
-			if len(out) == 0 {
-				continue
-			}
-			m.layers = append(m.layers, out...)
-			for _, f := range sl.fields {
-				fields[f] = true
-			}
-			if minZoom < 0 || sl.first < minZoom {
-				minZoom = sl.first
-			}
-			if sl.last > maxZoom {
-				maxZoom = sl.last
+			for _, part := range symbolizerParts(sym.Name) {
+				sl, ok := m.convertSymbolizer(l.ID, group, sym, part.conv, part.suffix)
+				if !ok {
+					continue
+				}
+				sl.Source = source
+				if sl.Type != "raster" {
+					sl.SourceLayer = sourceLayer
+				}
+				out := []Layer{sl.Layer}
+				if m.opts.Rewrite != nil {
+					out = m.opts.Rewrite(l, sl.Layer)
+				}
+				if len(out) == 0 {
+					continue
+				}
+				m.layers = append(m.layers, out...)
+				for _, f := range sl.fields {
+					fields[f] = true
+				}
+				if minZoom < 0 || sl.first < minZoom {
+					minZoom = sl.first
+				}
+				if sl.last > maxZoom {
+					maxZoom = sl.last
+				}
 			}
 		}
 	}
@@ -243,6 +250,25 @@ func groupByAttachment(rules []mss.Rule) []attachmentGroup {
 	return groups
 }
 
+type symbolizerPart struct {
+	conv   symConverter
+	suffix string // appended to the layer ID
+}
+
+// symbolizerParts returns the converters of the MapLibre layers a
+// symbolizer becomes, bottom first; none if it is not supported.
+func symbolizerParts(name string) []symbolizerPart {
+	conv, ok := converters[name]
+	if !ok {
+		return nil
+	}
+	var parts []symbolizerPart
+	if conv.underlay != nil {
+		parts = append(parts, symbolizerPart{*conv.underlay, conv.underlaySuffix})
+	}
+	return append(parts, symbolizerPart{conv, ""})
+}
+
 // symbolizersOf returns the symbolizers used by the rules in order of first
 // occurrence.
 func symbolizersOf(rules []mss.Rule) []mss.Prefix {
@@ -271,6 +297,9 @@ func (m *Map) noteUnsupported(layer string, group attachmentGroup) {
 			}
 			if !conv.draws(r.Properties) {
 				continue
+			}
+			if conv.approximated != "" {
+				m.note(layer, group.name, instanceName(p.Instance, p.Name), Approximated, conv.approximated)
 			}
 			for _, k := range r.Properties.Keys() {
 				if !strings.HasPrefix(k, p.Name) || isOtherPrefix(k, p.Name) {

@@ -377,3 +377,93 @@ func TestRewrite(t *testing.T) {
 		t.Errorf("expected the note of the hook, got %+v", n)
 	}
 }
+
+func notesOf(m *Map, kind NoteKind) []string {
+	var result []string
+	for _, n := range m.Notes() {
+		if n.Kind == kind {
+			result = append(result, n.Property)
+		}
+	}
+	return result
+}
+
+func TestPolygonPatternLayer(t *testing.T) {
+	m, style := build(t, `
+		#wetland[zoom>=11] {
+			polygon-pattern-file: url(Pattern/wetland_v02.svg);
+			polygon-pattern-opacity: 0.7;
+			polygon-pattern-comp-op: multiply;
+		}
+	`, "wetland")
+
+	l := layerByID(t, style, "wetland::::polygon-pattern")
+	if l["type"] != "fill" || l["source"] != "src" || l["source-layer"] != "wetland" {
+		t.Errorf("unexpected layer header %v", l)
+	}
+	assertJSON(t, "paint", l["paint"], `{"fill-opacity": 0.7, "fill-pattern": "Pattern/wetland_v02"}`)
+	assertJSON(t, "omitted", notesOf(m, Omitted), `["polygon-pattern-comp-op"]`)
+}
+
+func TestPolygonPatternByFilter(t *testing.T) {
+	_, style := build(t, `
+		#overlay {
+			[type='nature_reserve'] { polygon-pattern-file: url('Pattern/nature_reserve.svg'); }
+			[type='military'] { polygon-pattern-file: url("Pattern/military.png"); }
+		}
+	`, "overlay")
+
+	l := layerByID(t, style, "overlay::::polygon-pattern")
+	assertJSON(t, "filter", l["filter"], `["match", ["get", "type"], ["military", "nature_reserve"], true, false]`)
+	assertJSON(t, "paint", l["paint"], `{"fill-pattern": ["case", ["==", ["get", "type"], "military"], "Pattern/military", "Pattern/nature_reserve"]}`)
+}
+
+func TestBuildingLayer(t *testing.T) {
+	m, style := build(t, `
+		#buildings[zoom>=16] { building-fill: #e0d8c8; building-height: 1.25; }
+	`, "buildings")
+
+	all := layers(style)
+	if len(all) != 2 || all[0]["id"] != "buildings::::building-walls" || all[1]["id"] != "buildings::::building" {
+		t.Fatalf("expected walls below the roof, got %v", all)
+	}
+	for _, l := range all {
+		if l["type"] != "fill" || l["source-layer"] != "buildings" || l["minzoom"].(float64) != 15 {
+			t.Errorf("unexpected layer header %v", l)
+		}
+	}
+	// Mapnik draws the walls in the fill colour times 0.8, truncated.
+	assertJSON(t, "walls paint", all[0]["paint"], `{"fill-color": "#b3aca0"}`)
+	assertJSON(t, "roof paint", all[1]["paint"], `{
+		"fill-color": "#e0d8c8",
+		"fill-translate": ["literal", [0, -1.25]],
+		"fill-translate-anchor": "viewport"
+	}`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["building-"]`)
+	if infos := m.Layers(); len(infos) != 1 || infos[0].MinZoom != 15 {
+		t.Errorf("unexpected layer info %+v", infos)
+	}
+}
+
+func TestBuildingHeightByFeatureFallsBack(t *testing.T) {
+	m, style := build(t, `
+		#buildings {
+			building-fill: #cccccc; building-height: 1;
+			[type='tower'] { building-height: 3; }
+		}
+	`, "buildings")
+
+	roof := layerByID(t, style, "buildings::::building")
+	// fill-translate takes no data expressions: the fallback height for all.
+	assertJSON(t, "translate", roof["paint"].(map[string]interface{})["fill-translate"], `["literal", [0, -1]]`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["building-", "building-height"]`)
+	if n := m.Notes(); n[len(n)-1].Rules != 1 {
+		t.Errorf("building-height reported %d times, want once", n[len(n)-1].Rules)
+	}
+}
+
+func TestPatternPathIsCleaned(t *testing.T) {
+	_, style := build(t, `#w { polygon-pattern-file: url(./Pattern/wetland.svg); }`, "w")
+	l := layerByID(t, style, "w::::polygon-pattern")
+	assertJSON(t, "paint", l["paint"], `{"fill-pattern": "Pattern/wetland"}`)
+}

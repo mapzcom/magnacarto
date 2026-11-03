@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"path"
 	"sort"
 	"strings"
 
+	"github.com/omniscale/magnacarto/color"
 	"github.com/omniscale/magnacarto/mss"
 )
 
@@ -18,6 +20,9 @@ var symbolizerPrefixes = []string{"line-", "line-pattern-", "polygon-", "polygon
 type propConv struct {
 	target string
 	layout bool
+	// zoomOnly properties take no data expressions in MapLibre; where the
+	// value differs between features, the fallback value is used for all.
+	zoomOnly bool
 	// value returns the MapLibre value for a rule, or false if the rule does
 	// not set the property.
 	value func(p *mss.Properties) (interface{}, bool)
@@ -32,6 +37,22 @@ type symConverter struct {
 	draws   func(p *mss.Properties) bool
 	props   map[string]propConv
 	omitted map[string]string // property -> reason, for the report
+	// constPaint is added to the paint of every layer the symbolizer draws.
+	constPaint map[string]interface{}
+	// approximated, if set, is reported for every rule that draws.
+	approximated string
+	// underlay, if set, converts an extra layer drawn below this one, with
+	// underlaySuffix appended to the layer ID.
+	underlay       *symConverter
+	underlaySuffix string
+}
+
+// buildingOpacity is shared by the walls and the roof of a building.
+var buildingOpacity = propConv{target: "fill-opacity", value: floatValue("building-fill-opacity", 1), def: 1.0}
+
+func drawsBuilding(p *mss.Properties) bool {
+	_, ok := p.GetColor("building-fill")
+	return ok
 }
 
 var converters = map[string]symConverter{
@@ -49,6 +70,45 @@ var converters = map[string]symConverter{
 			"polygon-gamma":   "MapLibre antialiases fill edges itself (fill-antialias)",
 			"polygon-comp-op": "MapLibre has no compositing operations",
 		},
+	},
+	"polygon-pattern-": {
+		layerType: "fill",
+		draws: func(p *mss.Properties) bool {
+			f, ok := p.GetString("polygon-pattern-file")
+			return ok && f != ""
+		},
+		props: map[string]propConv{
+			"polygon-pattern-file":    {target: "fill-pattern", value: imageValue("polygon-pattern-file")},
+			"polygon-pattern-opacity": {target: "fill-opacity", value: floatValue("polygon-pattern-opacity", 1), def: 1.0},
+		},
+		omitted: map[string]string{
+			"polygon-pattern-comp-op":   "MapLibre has no compositing operations",
+			"polygon-pattern-gamma":     "MapLibre antialiases fill edges itself (fill-antialias)",
+			"polygon-pattern-alignment": "MapLibre always aligns patterns to the world (Mapnik's global alignment)",
+		},
+	},
+	"building-": {
+		layerType: "fill",
+		draws:     drawsBuilding,
+		props: map[string]propConv{
+			"building-fill":         {target: "fill-color", value: colorValue("building-fill")},
+			"building-fill-opacity": buildingOpacity,
+			"building-height":       {target: "fill-translate", zoomOnly: true, value: roofOffsetValue, def: literal([]float64{0, 0})},
+		},
+		// Mapnik draws the walls of a building in the fill colour times 0.8
+		// and the roof on top, moved up by the height.
+		underlaySuffix: "-walls",
+		underlay: &symConverter{
+			layerType: "fill",
+			draws:     drawsBuilding,
+			props: map[string]propConv{
+				"building-fill":         {target: "fill-color", value: wallColorValue},
+				"building-fill-opacity": buildingOpacity,
+			},
+		},
+		// Mapnik moves the roof up on the screen, whatever the bearing.
+		constPaint:   map[string]interface{}{"fill-translate-anchor": "viewport"},
+		approximated: "flat: walls as a fill in building-fill × 0.8, the roof on top moved up by building-height (fill-translate); no 3D extrusion",
 	},
 	"line-": {
 		layerType: "line",
@@ -106,6 +166,40 @@ func scalingValue(p *mss.Properties) (interface{}, bool) {
 		return "nearest", true
 	}
 	return "linear", true
+}
+
+// imageValue returns the sprite image name of a file: the path without its
+// extension, e.g. "Pattern/wetland" for url(Pattern/wetland.svg).
+func imageValue(name string) func(p *mss.Properties) (interface{}, bool) {
+	return func(p *mss.Properties) (interface{}, bool) {
+		f, ok := p.GetString(name)
+		if !ok || f == "" {
+			return nil, false
+		}
+		f = strings.TrimPrefix(path.Clean(f), "./")
+		return strings.TrimSuffix(f, path.Ext(f)), true
+	}
+}
+
+// wallColorValue returns building-fill times 0.8 per channel, truncated as
+// in Mapnik's building symbolizer.
+func wallColorValue(p *mss.Properties) (interface{}, bool) {
+	c, ok := p.GetColor("building-fill")
+	if !ok {
+		return nil, false
+	}
+	r, g, b := c.ToRgb()
+	wall := func(v float64) float64 { return math.Floor(math.Round(v*255)*0.8) / 255 }
+	return fmtColor(color.FromRgba(wall(r), wall(g), wall(b), c.A, false)), true
+}
+
+// roofOffsetValue moves the roof up by building-height pixels.
+func roofOffsetValue(p *mss.Properties) (interface{}, bool) {
+	h, ok := p.GetFloat("building-height")
+	if !ok {
+		return nil, false
+	}
+	return literal([]float64{0, -h}), true
 }
 
 func colorValue(name string) func(p *mss.Properties) (interface{}, bool) {
@@ -168,11 +262,7 @@ type caseEntry struct {
 
 // convertSymbolizer converts one symbolizer of an attachment to a MapLibre
 // layer. It returns false if the symbolizer draws nothing.
-func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefix) (convertedLayer, bool) {
-	conv, ok := converters[sym.Name]
-	if !ok {
-		return convertedLayer{}, false
-	}
+func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefix, conv symConverter, suffix string) (convertedLayer, bool) {
 
 	type zoomValues struct {
 		zoom   int
@@ -181,6 +271,7 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 	}
 	var zooms []zoomValues
 	isSet := map[string]bool{}
+	perFeature := map[string]bool{} // zoomOnly properties already reported
 	first, last, lastMapnik := -1, -1, -1
 
 	for zm := 0; zm <= m.opts.MaxMapnikZoom; zm++ {
@@ -221,7 +312,16 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 			zv.props = map[string]interface{}{}
 			for name, entries := range propEntries {
 				n := len(entries)
-				zv.props[name] = caseExpr(entries[:n-1], entries[n-1].value)
+				v := caseExpr(entries[:n-1], entries[n-1].value)
+				if conv.props[name].zoomOnly && !equal(v, entries[n-1].value) {
+					if !perFeature[name] {
+						perFeature[name] = true
+						m.note(layerID, g.name, instanceName(sym.Instance, name), Approximated,
+							"differs between features, MapLibre takes one value per zoom level: the fallback value for all")
+					}
+					v = entries[n-1].value
+				}
+				zv.props[name] = v
 			}
 		}
 		zooms = append(zooms, zv)
@@ -238,7 +338,7 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 		}
 	}
 
-	id := layerID + "::" + g.name + "::" + instanceName(sym.Instance, strings.TrimSuffix(sym.Name, "-"))
+	id := layerID + "::" + g.name + "::" + instanceName(sym.Instance, strings.TrimSuffix(sym.Name, "-")+suffix)
 	sl := convertedLayer{
 		Layer: Layer{ID: id, Type: conv.layerType},
 		first: first,
@@ -290,6 +390,13 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 			}
 			sl.Paint[pc.target] = v
 		}
+	}
+
+	for k, v := range conv.constPaint {
+		if sl.Paint == nil {
+			sl.Paint = map[string]interface{}{}
+		}
+		sl.Paint[k] = v
 	}
 
 	fields := map[string]bool{}
