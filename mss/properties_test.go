@@ -132,3 +132,29 @@ func TestPropertiesGet(t *testing.T) {
 	}
 
 }
+
+func TestPropertiesKeys(t *testing.T) {
+	p := &Properties{}
+	if keys := p.Keys(); len(keys) != 0 {
+		t.Error("expected no keys for empty properties, got", keys)
+	}
+
+	p.setPos(key{name: "line-width"}, 2.0, position{})
+	p.setPos(key{name: "line-color"}, color.Color{0, 0, 0, 0, false}, position{})
+	p.setPos(key{name: "line-width", instance: "casing"}, 4.0, position{})
+	p.setPos(key{name: "line-opacity", instance: "casing"}, 0.5, position{})
+
+	if keys := p.Keys(); !reflect.DeepEqual(keys, []string{"line-color", "line-width"}) {
+		t.Error("default instance", keys)
+	}
+
+	p.SetDefaultInstance("casing")
+	if keys := p.Keys(); !reflect.DeepEqual(keys, []string{"line-opacity", "line-width"}) {
+		t.Error("casing instance", keys)
+	}
+
+	p.SetDefaultInstance("unknown")
+	if keys := p.Keys(); len(keys) != 0 {
+		t.Error("unknown instance", keys)
+	}
+}

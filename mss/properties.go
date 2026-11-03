@@ -203,6 +203,19 @@ func (p *Properties) SetDefaultInstance(instance string) {
 	p.defaultInstance = instance
 }
 
+// Keys returns the sorted names of all properties of the default instance,
+// i.e. all names that are set for the instance selected by SetDefaultInstance.
+func (p *Properties) Keys() []string {
+	var names []string
+	for k := range p.values {
+		if k.instance == p.defaultInstance {
+			names = append(names, k.name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (p *Properties) GetBool(property string) (bool, bool) {
 	v, ok := p.get(property)
 	if !ok {
