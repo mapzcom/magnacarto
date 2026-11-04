@@ -18,6 +18,11 @@
 // must provide them. Buildings are drawn flat: walls below, the roof moved
 // up by the building height.
 //
+// Point, shield and marker images become symbol layers with icons from the
+// same sprite images (or the ones Options.IconImage names); icon-size is the
+// scale of *-transform corrected by Options.ImageSize. Shields draw icon
+// and text in one layer, the text converted like text-.
+//
 // Raster symbolizers become "raster" layers without a source-layer. Options.Rewrite
 // lets the caller change converted layers, e.g. draw a raster from a DEM
 // source as "hillshade" or "color-relief".
@@ -67,6 +72,12 @@ type Options struct {
 	// opacity to draw with instead, plus the reason for the report. With ok
 	// false the operation is omitted.
 	Blend func(op string, c color.Color, opacity float64) (blended color.Color, blendedOpacity float64, detail string, ok bool)
+	// ImageSize, if set, returns the width of an image as Mapnik draws it
+	// (e.g. the width of the SVG) and as MapLibre draws the sprite image
+	// (in CSS pixels), for the sprite image name (see imageValue). Icons are
+	// scaled by their ratio, and marker-width is converted with it; without
+	// it both widths are taken as equal.
+	ImageSize func(image string) (native, sprite float64, ok bool)
 	// Sources is written as the style's "sources".
 	Sources map[string]interface{}
 	// Name and Metadata are written to the style as is.
@@ -75,6 +86,20 @@ type Options struct {
 	// Glyphs and Sprite are written to the style if set.
 	Glyphs string
 	Sprite string
+	// Sprites, if set, are written as the style's list of sprites instead
+	// of Sprite.
+	Sprites []Sprite
+	// IconImage, if set, returns the name under which the style references
+	// the image of an icon (point-, shield-, marker-), e.g. in another
+	// sprite ("x4:Town/circle"). Options.ImageSize then gives the width of
+	// that sprite image. Pattern images are not changed.
+	IconImage func(image string) string
+}
+
+// Sprite is one sprite of a style's list of sprites.
+type Sprite struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
 }
 
 // DefaultOptions returns Options for 512 px vector tiles and Mapnik zoom
@@ -248,11 +273,11 @@ type attachmentGroup struct {
 	name  string
 	rules []mss.Rule
 	conds []interface{} // MapLibre condition per rule
-	// passes are following attachments whose text is merged into this
-	// one, see mergePasses; mergedZooms are the Mapnik zoom levels at which
-	// the text of such a pass is merged.
-	passes      []attachmentGroup
-	mergedZooms map[int]bool
+	// passes are following attachments whose label is merged into this
+	// one, per label symbolizer prefix, see mergePasses; mergedZooms are the
+	// Mapnik zoom levels at which the label of such a pass is merged.
+	passes      map[string][]attachmentGroup
+	mergedZooms map[string]map[int]bool
 }
 
 // groupByAttachment groups rules by attachment in order of first occurrence,
@@ -328,8 +353,9 @@ func (m *Map) noteUnsupported(layer string, group attachmentGroup) {
 					continue
 				}
 				if approx, ok := conv.approximate[k]; ok {
-					if detail, ok := approx(r.Properties); ok {
+					if detail, ok := approx(m, r.Properties); ok {
 						m.note(layer, group.name, instanceName(p.Instance, k), Approximated, detail)
+						continue
 					}
 				}
 				if _, ok := conv.props[k]; ok || conv.handles(k) {
@@ -392,8 +418,12 @@ func (m *Map) Write(w io.Writer) error {
 		Metadata: m.opts.Metadata,
 		Sources:  m.opts.Sources,
 		Glyphs:   m.opts.Glyphs,
-		Sprite:   m.opts.Sprite,
 		Layers:   []Layer{},
+	}
+	if len(m.opts.Sprites) > 0 {
+		s.Sprite = m.opts.Sprites
+	} else if m.opts.Sprite != "" {
+		s.Sprite = m.opts.Sprite
 	}
 	if s.Sources == nil {
 		s.Sources = map[string]interface{}{}
@@ -506,7 +536,7 @@ type style struct {
 	Name     string                 `json:"name,omitempty"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 	Sources  map[string]interface{} `json:"sources"`
-	Sprite   string                 `json:"sprite,omitempty"`
+	Sprite   interface{}            `json:"sprite,omitempty"`
 	Glyphs   string                 `json:"glyphs,omitempty"`
 	Layers   []Layer                `json:"layers"`
 }

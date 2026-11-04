@@ -26,7 +26,19 @@ func testOptions() Options {
 // build converts the MSS for the given layer IDs and returns the decoded style.
 func build(t *testing.T, mss string, layerIDs ...string) (*Map, map[string]interface{}) {
 	t.Helper()
-	m := New(testOptions())
+	return buildMap(t, testOptions(), mss, layerIDs...)
+}
+
+// buildWith is build with other options.
+func buildWith(t *testing.T, opts Options, mss string, layerIDs ...string) map[string]interface{} {
+	t.Helper()
+	_, style := buildMap(t, opts, mss, layerIDs...)
+	return style
+}
+
+func buildMap(t *testing.T, opts Options, mss string, layerIDs ...string) (*Map, map[string]interface{}) {
+	t.Helper()
+	m := New(opts)
 	mmlObj := &mml.MML{}
 	for _, id := range layerIDs {
 		mmlObj.Layers = append(mmlObj.Layers, mml.Layer{ID: id, Active: true})
@@ -253,15 +265,15 @@ func TestLayerInfo(t *testing.T) {
 
 func TestUnsupportedSymbolizerIsReported(t *testing.T) {
 	m, style := build(t, `
-		#labels { shield-name: [name]; shield-face-name: 'Arial'; shield-size: 10; shield-file: url(a.svg); }
+		#labels { dot-fill: #ff0000; dot-width: 4; }
 	`, "labels")
 
 	if len(layers(style)) != 0 {
 		t.Errorf("expected no layers, got %v", layers(style))
 	}
 	notes := m.Notes()
-	if len(notes) != 1 || notes[0].Property != "shield-" || notes[0].Kind != Omitted {
-		t.Errorf("expected an omitted shield symbolizer note, got %+v", notes)
+	if len(notes) != 1 || notes[0].Property != "dot-" || notes[0].Kind != Omitted {
+		t.Errorf("expected an omitted dot symbolizer note, got %+v", notes)
 	}
 }
 
@@ -841,4 +853,298 @@ func TestPassForOtherFeaturesIsNotMerged(t *testing.T) {
 func TestNonSimplePlacementTypeIsReported(t *testing.T) {
 	m, _ := build(t, `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-placement-type: list; }`, "places")
 	assertJSON(t, "approximated", notesOf(m, Approximated), `["text-placement-type"]`)
+}
+
+func TestPointLayer(t *testing.T) {
+	m, style := build(t, `
+		#pois[zoom>=15] {
+			[type='hospital'] { point-file: url(Security/hospital.svg); }
+			[type='camp_site'] { point-file: url(Accommodation/camping.svg); point-allow-overlap: true; }
+			point-placement: interior;
+			[zoom=15] { point-transform: "scale(2.2)"; }
+			[zoom>=16] { point-transform: "scale(2.5)"; }
+		}
+	`, "pois")
+	l := layerByID(t, style, "pois::::point")
+	if l["type"] != "symbol" || l["source-layer"] != "pois" || l["minzoom"].(float64) != 14 {
+		t.Errorf("unexpected layer header %v", l)
+	}
+	assertJSON(t, "filter", l["filter"], `["match", ["get", "type"], ["camp_site", "hospital"], true, false]`)
+	assertJSON(t, "layout", l["layout"], `{
+		"icon-allow-overlap": false,
+		"icon-image": ["case", ["==", ["get", "type"], "camp_site"], "Accommodation/camping", "Security/hospital"],
+		"icon-padding": 0,
+		"icon-size": ["step", ["zoom"], 2.2, 15, 2.5],
+		"symbol-z-order": "source"
+	}`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["point-allow-overlap"]`)
+	assertJSON(t, "omitted", notesOf(m, Omitted), `null`)
+}
+
+// Martin rounds sprite images to whole pixels; icon-size draws them at the
+// size of the image file.
+func TestImageSizeCorrectsIconSize(t *testing.T) {
+	opts := testOptions()
+	opts.ImageSize = func(image string) (float64, float64, bool) {
+		if image == "a" {
+			return 5, 4, true
+		}
+		return 0, 0, false
+	}
+	style := buildWith(t, opts, `
+		#pois { point-file: url(a.svg); point-transform: "scale(2)"; [type='b'] { point-file: url(b.svg); } }
+	`, "pois")
+	l := layerByID(t, style, "pois::::point")
+	assertJSON(t, "icon-size", l["layout"].(map[string]interface{})["icon-size"],
+		`["case", ["==", ["get", "type"], "b"], 2, 2.5]`)
+}
+
+func TestShieldLayer(t *testing.T) {
+	m, style := build(t, `
+		#towns[zoom>=6] {
+			shield-file: url(Town/circle.svg);
+			shield-name: '[name]';
+			shield-face-name: 'Arial';
+			shield-fill: #333333;
+			shield-text-transform: uppercase;
+			shield-repeat-distance: 20;
+			shield-unlock-image: true;
+			shield-placement-type: simple; shield-placements: "NE,W";
+			shield-size: 10; shield-wrap-width: 40; shield-transform: "scale(0.7)";
+			shield-text-dx: 3; shield-text-dy: 4;
+			[zoom>=7] { shield-size: 20; shield-transform: "scale(0.8)"; shield-margin: 2; }
+		}
+	`, "towns")
+	l := layerByID(t, style, "towns::::shield")
+	if l["type"] != "symbol" || l["minzoom"].(float64) != 5 {
+		t.Errorf("unexpected layer header %v", l)
+	}
+	assertJSON(t, "layout", l["layout"], `{
+		"icon-image": "Town/circle",
+		"icon-padding": 0,
+		"icon-rotation-alignment": "viewport",
+		"icon-size": ["step", ["zoom"], 0.7, 6, 0.8],
+		"symbol-z-order": "source",
+		"text-field": ["get", "name"],
+		"text-font": ["literal", ["Arial"]],
+		"text-justify": "auto",
+		"text-max-width": ["step", ["zoom"], 4, 6, 2],
+		"text-padding": ["step", ["zoom"], 0, 6, 2],
+		"text-rotation-alignment": "viewport",
+		"text-size": ["step", ["zoom"], 10, 6, 20],
+		"text-transform": "uppercase",
+		"text-variable-anchor-offset": ["step", ["zoom"],
+			["literal", ["bottom-left", [0.3, -0.4], "right", [-0.3, 0]]], 6,
+			["literal", ["bottom-left", [0.15, -0.2], "right", [-0.15, 0]]]]
+	}`)
+	assertJSON(t, "paint", l["paint"], `{"text-color": "#333333"}`)
+	assertJSON(t, "omitted", notesOf(m, Omitted), `["shield-repeat-distance"]`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `null`)
+}
+
+// Mapnik keeps shields upright along lines; the image is drawn without text
+// where the name is empty.
+func TestLineShieldAndEmptyName(t *testing.T) {
+	_, style := build(t, `
+		#refs {
+			shield-name: "[ref]"; shield-face-name: 'Arial'; shield-size: 9;
+			shield-file: url(Highway_Shield/motorway.svg);
+			shield-placement: line; shield-spacing: 40;
+			[reflen>3] { shield-name: ""; shield-file: url(Highway_Shield/junction.svg); }
+		}
+	`, "refs")
+	l := layerByID(t, style, "refs::::shield")
+	layout := l["layout"].(map[string]interface{})
+	if _, ok := l["filter"]; ok {
+		t.Errorf("unexpected filter %v: the image is drawn without a name", l["filter"])
+	}
+	assertJSON(t, "placement", layout["symbol-placement"], `"line"`)
+	assertJSON(t, "spacing", layout["symbol-spacing"], `40`)
+	assertJSON(t, "rotation", layout["text-rotation-alignment"], `"viewport"`)
+	assertJSON(t, "field", layout["text-field"],
+		`["case", ["all", ["==", ["typeof", ["get", "reflen"]], "number"], [">", ["get", "reflen"], 3]], "", ["get", "ref"]]`)
+}
+
+func TestShieldPassesBecomeFurtherAnchors(t *testing.T) {
+	m, style := build(t, `
+		#towns {
+			::center, ::var1 {
+				shield-file: url(a.svg); shield-name: [name]; shield-face-name: 'Arial'; shield-size: 10;
+				shield-repeat-distance: 20; shield-unlock-image: true;
+				shield-placement-type: simple; shield-placements: "E,W";
+			}
+			::center { shield-text-dx: 2; }
+			::var1 { shield-text-dx: 4; }
+		}
+	`, "towns")
+	var ids []interface{}
+	for _, l := range layers(style) {
+		ids = append(ids, l["id"])
+	}
+	assertJSON(t, "layers", ids, `["towns::center::shield"]`)
+	assertJSON(t, "anchors", layerByID(t, style, "towns::center::shield")["layout"].(map[string]interface{})["text-variable-anchor-offset"],
+		`["literal", ["left", [0.2, 0], "right", [-0.2, 0], "left", [0.4, 0], "right", [-0.4, 0]]]`)
+	var merged []string
+	for _, n := range m.Notes() {
+		if n.Property == "shield-" && n.Kind == Approximated {
+			merged = append(merged, n.Attachment)
+		}
+	}
+	assertJSON(t, "merged passes", merged, `["var1"]`)
+}
+
+// A pass with another image is not the same shield.
+func TestShieldPassWithOtherImageIsNotMerged(t *testing.T) {
+	_, style := build(t, `
+		#towns {
+			::center, ::var1 { shield-name: [name]; shield-face-name: 'Arial'; shield-size: 10; shield-repeat-distance: 20; }
+			::center { shield-file: url(a.svg); }
+			::var1 { shield-file: url(b.svg); shield-text-dx: 4; }
+		}
+	`, "towns")
+	if n := len(layers(style)); n != 2 {
+		t.Errorf("%d layers, want 2", n)
+	}
+}
+
+func TestShieldSizeDefaultsToMapnik(t *testing.T) {
+	_, style := build(t, `
+		#junctions { shield-file: url(a.svg); shield-name: [ref]; shield-face-name: 'Arial'; [reflen=2] { shield-size: 8; } }
+	`, "junctions")
+	assertJSON(t, "text-size", layerByID(t, style, "junctions::::shield")["layout"].(map[string]interface{})["text-size"],
+		`["case", ["==", ["get", "reflen"], 2], 8, 10]`)
+}
+
+func TestLineMarkerLayer(t *testing.T) {
+	opts := testOptions()
+	opts.ImageSize = func(image string) (float64, float64, bool) { return 6.8, 8, true }
+	m, style := buildMap(t, opts, `
+		#oneway[zoom>=17] {
+			marker-file: url(Highway_Shield/oneway.svg);
+			marker-placement: line;
+			marker-max-error: 5;
+			[zoom=17] { marker-width: 10; marker-spacing: 200; }
+			[zoom>=18] { marker-width: 14; marker-spacing: 400; }
+		}
+	`, "oneway")
+	l := layerByID(t, style, "oneway::::marker")
+	assertJSON(t, "layout", l["layout"], `{
+		"icon-image": "Highway_Shield/oneway",
+		"icon-padding": 0,
+		"icon-size": ["step", ["zoom"], 1.25, 17, 1.75],
+		"symbol-placement": "line",
+		"symbol-spacing": ["step", ["zoom"], 200, 17, 400],
+		"symbol-z-order": "source"
+	}`)
+	assertJSON(t, "omitted", notesOf(m, Omitted), `["marker-max-error"]`)
+}
+
+// Without the image size the marker is drawn at the size of its sprite
+// image.
+func TestMarkerWidthNeedsImageSize(t *testing.T) {
+	m, style := build(t, `#a { marker-file: url(a.svg); marker-width: 10; }`, "a")
+	l := layerByID(t, style, "a::::marker")
+	assertJSON(t, "icon-size", l["layout"].(map[string]interface{})["icon-size"], `1`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["marker-width"]`)
+}
+
+func TestShieldWithoutSizeUsesDefaultForEms(t *testing.T) {
+	_, style := build(t, `
+		#j { shield-file: url(a.svg); shield-name: [ref]; shield-face-name: 'Arial'; shield-wrap-width: 20; shield-text-dx: 5;
+			[reflen=2] { shield-size: 5; } }
+	`, "j")
+	layout := layerByID(t, style, "j::::shield")["layout"].(map[string]interface{})
+	assertJSON(t, "max-width", layout["text-max-width"], `["case", ["==", ["get", "reflen"], 2], 4, 2]`)
+}
+
+// MapLibre multiplies icon-offset by icon-size, like a translate after a
+// scale in an SVG transform list.
+func TestPointTransformWithTranslate(t *testing.T) {
+	m, style := build(t, `
+		#detail {
+			point-file: url(flag.svg);
+			[type='a'] { point-transform: "scale(2.0),translate(1.5,-2.5)"; }
+			[type='b'] { point-transform: "translate(4, 2) scale(2)"; }
+		}
+	`, "detail")
+	layout := layerByID(t, style, "detail::::point")["layout"].(map[string]interface{})
+	assertJSON(t, "icon-size", layout["icon-size"], `["match", ["get", "type"], ["b", "a"], 2, 1]`)
+	assertJSON(t, "icon-offset", layout["icon-offset"],
+		`["match", ["get", "type"], "b", ["literal", [2, 1]], "a", ["literal", [1.5, -2.5]], ["literal", [0, 0]]]`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `null`)
+}
+
+func TestMarkerTranslateIsReported(t *testing.T) {
+	m, _ := build(t, `#a { marker-file: url(a.svg); marker-transform: "translate(1,2)"; }`, "a")
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["marker-transform"]`)
+}
+
+// Mapnik breaks the line at \n in the text.
+func TestTextNameNewline(t *testing.T) {
+	_, style := build(t, `#peaks { text-name: [name]+'\n'+[ele]+'m'; text-face-name: 'Arial'; text-size: 10; }`, "peaks")
+	assertJSON(t, "text-field", layerByID(t, style, "peaks::::text")["layout"].(map[string]interface{})["text-field"],
+		`["concat", ["get", "name"], "\n", ["get", "ele"], "m"]`)
+}
+
+// Along a line, Mapnik repeats a shield no closer than its repeat distance.
+func TestLineShieldSpacingKeepsRepeatDistance(t *testing.T) {
+	m, style := build(t, `
+		#refs[zoom>=8] {
+			shield-name: "[ref]"; shield-face-name: 'Arial'; shield-size: 9; shield-file: url(a.svg);
+			shield-placement: line; shield-spacing: 40;
+			[zoom=8] { shield-repeat-distance: 120; }
+			[zoom>=9] { shield-repeat-distance: 20; }
+		}
+	`, "refs")
+	layout := layerByID(t, style, "refs::::shield")["layout"].(map[string]interface{})
+	assertJSON(t, "spacing", layout["symbol-spacing"], `["step", ["zoom"], 120, 8, 40]`)
+	assertJSON(t, "approximated", notesOf(m, Approximated), `["shield-repeat-distance"]`)
+	assertJSON(t, "omitted", notesOf(m, Omitted), `null`)
+}
+
+// Icons can come from another sprite than patterns, e.g. one with images
+// in a higher resolution.
+func TestIconsFromOtherSprite(t *testing.T) {
+	opts := testOptions()
+	opts.Sprites = []Sprite{{ID: "default", URL: "{{MARTIN}}/sprite/all"}, {ID: "x4", URL: "{{MARTIN}}/sprite/all_x4"}}
+	opts.IconImage = func(image string) string { return "x4:" + image }
+	opts.ImageSize = func(image string) (float64, float64, bool) {
+		if image == "Town/circle" {
+			return 5, 20, true
+		}
+		return 0, 0, false
+	}
+	style := buildWith(t, opts, `
+		#towns { shield-file: url(Town/circle.svg); shield-name: [name]; shield-face-name: 'Arial'; shield-size: 10; shield-transform: "scale(2)"; }
+		#pois { point-file: url(Town/circle.svg); }
+		#wetland { polygon-pattern-file: url(Pattern/wetland.svg); }
+	`, "towns", "pois", "wetland")
+	assertJSON(t, "sprite", style["sprite"],
+		`[{"id": "default", "url": "{{MARTIN}}/sprite/all"}, {"id": "x4", "url": "{{MARTIN}}/sprite/all_x4"}]`)
+	shield := layerByID(t, style, "towns::::shield")["layout"].(map[string]interface{})
+	assertJSON(t, "shield image", shield["icon-image"], `"x4:Town/circle"`)
+	assertJSON(t, "shield size", shield["icon-size"], `0.5`)
+	point := layerByID(t, style, "pois::::point")["layout"].(map[string]interface{})
+	assertJSON(t, "point image", point["icon-image"], `"x4:Town/circle"`)
+	assertJSON(t, "point size", point["icon-size"], `0.25`)
+	assertJSON(t, "pattern", layerByID(t, style, "wetland::::polygon-pattern")["paint"].(map[string]interface{})["fill-pattern"],
+		`"Pattern/wetland"`)
+}
+
+func TestZeroScaleHasNoOffset(t *testing.T) {
+	_, style := build(t, `#a { point-file: url(a.svg); point-transform: "translate(2,2) scale(0)"; }`, "a")
+	layout := layerByID(t, style, "a::::point")["layout"].(map[string]interface{})
+	if _, ok := layout["icon-offset"]; ok {
+		t.Errorf("unexpected icon-offset %v", layout["icon-offset"])
+	}
+}
+
+// Mapnik's defaults apply where no rule sets them.
+func TestIconDefaults(t *testing.T) {
+	_, style := build(t, `
+		#m { marker-file: url(a.svg); marker-placement: line; }
+		#s { shield-file: url(a.svg); shield-name: [ref]; shield-face-name: 'Arial'; }
+	`, "m", "s")
+	assertJSON(t, "marker spacing", layerByID(t, style, "m::::marker")["layout"].(map[string]interface{})["symbol-spacing"], `100`)
+	assertJSON(t, "shield size", layerByID(t, style, "s::::shield")["layout"].(map[string]interface{})["text-size"], `10`)
 }

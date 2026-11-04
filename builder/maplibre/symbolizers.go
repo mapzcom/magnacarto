@@ -28,6 +28,9 @@ type propConv struct {
 	// value returns the MapLibre value for a rule, or false if the rule does
 	// not set the property.
 	value func(p *mss.Properties) (interface{}, bool)
+	// mapValue, if set, is used instead of value, for values that depend
+	// on the Options.
+	mapValue func(m *Map, p *mss.Properties) (interface{}, bool)
 	// def is the MapLibre value for Mapnik's default, used for rules that
 	// do not set the property while others do.
 	def interface{}
@@ -43,7 +46,7 @@ type symConverter struct {
 	handled []string
 	// approximate returns the reason for the report if a property of a
 	// rule is converted with a visible difference.
-	approximate map[string]func(p *mss.Properties) (string, bool)
+	approximate map[string]func(m *Map, p *mss.Properties) (string, bool)
 	// constPaint is added to the paint of every layer the symbolizer draws.
 	constPaint map[string]interface{}
 	// constLayout is added to the layout of every layer the symbolizer draws.
@@ -56,6 +59,8 @@ type symConverter struct {
 	underlaySuffix string
 	// blend, if set, names the properties Options.Blend works on.
 	blend *blendProps
+	// label, if set, merges passes of the symbolizer (see passes.go).
+	label *labelProps
 }
 
 // blendProps are the compositing operation of a symbolizer and the colour
@@ -176,7 +181,10 @@ var converters = map[string]symConverter{
 		},
 		blend: &blendProps{compOp: "line-comp-op", color: "line-color", opacity: "line-opacity"},
 	},
-	"text-": textConverter,
+	"text-":   textConverter,
+	"shield-": shieldConverter,
+	"point-":  pointConverter,
+	"marker-": markerConverter,
 	"raster-": {
 		layerType: "raster",
 		draws: func(p *mss.Properties) bool {
@@ -334,15 +342,15 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 		}
 		var filterEntries []caseEntry
 		propEntries := map[string][]caseEntry{}
-		// Text merged into an earlier attachment is drawn there.
-		merged := sym.Name == "text-" && sym.Instance == ""
-		if merged && g.mergedZooms[zm] {
+		// A label merged into an earlier attachment is drawn there.
+		merged := conv.label != nil && sym.Instance == ""
+		if merged && g.mergedZooms[sym.Name][zm] {
 			zooms = append(zooms, zoomValues{zoom: z, filter: false})
 			continue
 		}
 		var passRules [][]validRule
-		for _, pass := range g.passes {
-			if merged && pass.mergedZooms[zm] {
+		for _, pass := range g.passes[sym.Name] {
+			if merged && pass.mergedZooms[sym.Name][zm] {
 				passRules = append(passRules, validRules(pass, zm))
 			}
 		}
@@ -357,18 +365,18 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 			if draws {
 				blended, _, _ := m.blended(conv, r.Properties)
 				for name, pc := range conv.props {
-					v, ok := pc.value(r.Properties)
+					v, ok := m.propValue(pc, r.Properties)
 					if bv, isBlended := blended[name]; isBlended {
 						v, ok = bv, true
 					}
-					if pc.target == "text-variable-anchor-offset" && len(passRules) > 0 && !isLinePlacement(r.Properties) {
+					if pc.target == "text-variable-anchor-offset" && len(passRules) > 0 && !isLinePlacement(conv.textView(r.Properties)) {
 						var passes []*mss.Properties
 						for _, pr := range passRules {
 							if pp, found := ruleFor(pr, cond); found {
-								passes = append(passes, pp)
+								passes = append(passes, conv.textView(pp))
 							}
 						}
-						v, ok = mergedAnchors(r.Properties, passes), true
+						v, ok = mergedAnchors(conv.textView(r.Properties), passes), true
 					}
 					if ok {
 						isSet[name] = true
@@ -389,6 +397,9 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 			last, lastMapnik = z, zm
 			zv.props = map[string]interface{}{}
 			for name, entries := range propEntries {
+				// A rule with the condition of an earlier one never
+				// decides, so it cannot be the fallback either.
+				entries = withoutShadowed(entries)
 				n := len(entries)
 				v := caseExpr(entries[:n-1], entries[n-1].value)
 				if conv.props[name].zoomOnly && !equal(v, entries[n-1].value) {
@@ -827,6 +838,14 @@ func (m *Map) filterExpr(layerID, attachment string, f mss.Filter) interface{} {
 		[]interface{}{"==", []interface{}{"typeof", get}, typ},
 		[]interface{}{op, get, f.Value},
 	}
+}
+
+// propValue returns the MapLibre value of a property for a rule.
+func (m *Map) propValue(pc propConv, p *mss.Properties) (interface{}, bool) {
+	if pc.mapValue != nil {
+		return pc.mapValue(m, p)
+	}
+	return pc.value(p)
 }
 
 func (c symConverter) handles(property string) bool {

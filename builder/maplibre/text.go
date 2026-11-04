@@ -59,14 +59,14 @@ var textConverter = symConverter{
 		"text-halo-radius": {target: "text-halo-width", value: floatValue("text-halo-radius", 1), def: 0.0},
 	},
 	handled: []string{"text-dy", "text-placement-type", "text-horizontal-alignment", "text-vertical-alignment"},
-	approximate: map[string]func(p *mss.Properties) (string, bool){
-		"text-placement-type": func(p *mss.Properties) (string, bool) {
+	approximate: map[string]func(m *Map, p *mss.Properties) (string, bool){
+		"text-placement-type": func(_ *Map, p *mss.Properties) (string, bool) {
 			if t, ok := p.GetString("text-placement-type"); ok && t != "simple" && t != "dummy" {
 				return "only simple placements are converted, the label keeps its first position", true
 			}
 			return "", false
 		},
-		"text-placements": func(p *mss.Properties) (string, bool) {
+		"text-placements": func(_ *Map, p *mss.Properties) (string, bool) {
 			if _, sizes := placementDirections(p); sizes {
 				return "only the first text size: MapLibre has no smaller fallback sizes", true
 			}
@@ -81,6 +81,10 @@ var textConverter = symConverter{
 		"text-halo-comp-op":             "MapLibre has no compositing operations",
 	},
 	constLayout: map[string]interface{}{"symbol-z-order": "source"},
+	label: &labelProps{
+		placement:      map[string]bool{"text-placements": true, "text-dx": true, "text-justify-alignment": true},
+		repeatDistance: "text-repeat-distance",
+	},
 }
 
 var fieldRe = regexp.MustCompile(`\[([^\]]+)\]`)
@@ -97,6 +101,7 @@ func textFieldValue(p *mss.Properties) (interface{}, bool) {
 		if s == "" {
 			return
 		}
+		s = strings.ReplaceAll(s, `\n`, "\n")
 		if n := len(parts); n > 0 {
 			if prev, ok := parts[n-1].(string); ok {
 				parts[n-1] = prev + s
@@ -148,7 +153,7 @@ func emValue(name string, base float64, positive bool) func(p *mss.Properties) (
 		if !ok || (positive && v <= 0) {
 			return nil, false
 		}
-		size, _ := p.GetFloat("text-size")
+		size := textSize(p)
 		return base + v/size, true
 	}
 }
@@ -267,7 +272,7 @@ func anchorList(p *mss.Properties) []interface{} {
 	if len(dirs) == 0 {
 		dirs = []string{"X"}
 	}
-	size, _ := p.GetFloat("text-size")
+	size := textSize(p)
 	var result []interface{}
 	for _, d := range dirs {
 		x, y := dx, dy
@@ -339,7 +344,7 @@ func lineOffsetValue(p *mss.Properties) (interface{}, bool) {
 	if !okx && !oky {
 		return nil, false
 	}
-	size, _ := p.GetFloat("text-size")
+	size := textSize(p)
 	return literal([]float64{em(dx, size), em(dy, size)}), true
 }
 
@@ -398,4 +403,16 @@ func splitLineLabels(l Layer) []Layer {
 		result = append(result, part)
 	}
 	return result
+}
+
+// defaultTextSize is Mapnik's text-size; text without one is not drawn, but
+// a shield is.
+const defaultTextSize = 10.0
+
+// textSize returns text-size for converting pixels to ems.
+func textSize(p *mss.Properties) float64 {
+	if size, ok := p.GetFloat("text-size"); ok && size > 0 {
+		return size
+	}
+	return defaultTextSize
 }
