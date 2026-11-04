@@ -158,3 +158,37 @@ func TestPropertiesKeys(t *testing.T) {
 		t.Error("unknown instance", keys)
 	}
 }
+
+func TestPropertiesRenamed(t *testing.T) {
+	p := &Properties{}
+	p.setPos(key{name: "shield-size"}, 10.0, position{})
+	p.setPos(key{name: "shield-text-dx"}, 3.0, position{})
+	p.setPos(key{name: "shield-file"}, "a.svg", position{})
+	p.setPos(key{name: "shield-size", instance: "other"}, 20.0, position{})
+
+	rename := func(name string) (string, bool) {
+		switch name {
+		case "shield-size":
+			return "text-size", true
+		case "shield-text-dx":
+			return "text-dx", true
+		}
+		return "", false
+	}
+	r := p.Renamed(rename)
+	if keys := r.Keys(); !reflect.DeepEqual(keys, []string{"text-dx", "text-size"}) {
+		t.Error("default instance", keys)
+	}
+	if v, _ := r.GetFloat("text-size"); v != 10 {
+		t.Error("text-size", v)
+	}
+
+	p.SetDefaultInstance("other")
+	r = p.Renamed(rename)
+	if v, _ := r.GetFloat("text-size"); v != 20 {
+		t.Error("instance text-size", v)
+	}
+	if _, ok := r.GetFloat("text-dx"); ok {
+		t.Error("text-dx of other instance")
+	}
+}

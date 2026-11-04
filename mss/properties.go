@@ -381,3 +381,19 @@ func NewPropertiesInstance(kiv ...interface{}) *Properties {
 	}
 	return r
 }
+
+// Renamed returns the properties of the default instance under new names,
+// as properties without instance; rename returns the new name of a property,
+// or false to leave it out. E.g. the text properties of a shield as text-*.
+func (p *Properties) Renamed(rename func(name string) (string, bool)) *Properties {
+	result := &Properties{values: map[key]attr{}}
+	for k, v := range p.values {
+		if k.instance != p.defaultInstance {
+			continue
+		}
+		if name, ok := rename(k.name); ok {
+			result.values[key{name: name}] = v
+		}
+	}
+	return result
+}
