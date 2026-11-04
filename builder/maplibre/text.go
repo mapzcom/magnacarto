@@ -42,8 +42,10 @@ var textConverter = symConverter{
 		"text-transform":         {target: "text-transform", layout: true, def: "none", value: transformValue},
 		"text-justify-alignment": {target: "text-justify", layout: true, always: true, def: "auto", value: justifyValue},
 		// Mapnik keeps no space around labels unless text-margin is set,
-		// MapLibre 2 px by default.
-		"text-margin":               {target: "text-padding", layout: true, zoomOnly: true, always: true, def: 0.0, value: floatValue("text-margin", 1)},
+		// MapLibre 2 px by default. Mapnik keeps a label text-margin away
+		// from the boxes of earlier labels, MapLibre pads the boxes of both:
+		// half the margin each.
+		"text-margin":               {target: "text-padding", layout: true, zoomOnly: true, always: true, def: 0.0, value: floatValue("text-margin", 0.5)},
 		"text-placement":            {target: "symbol-placement", layout: true, zoomOnly: true, def: "point", value: placementValue},
 		"text-spacing":              {target: "symbol-spacing", layout: true, zoomOnly: true, def: 250.0, value: positiveValue("text-spacing")},
 		"text-allow-overlap":        {target: "text-allow-overlap", layout: true, zoomOnly: true, def: false, value: boolValue("text-allow-overlap")},

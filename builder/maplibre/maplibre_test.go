@@ -929,7 +929,7 @@ func TestShieldLayer(t *testing.T) {
 		"text-font": ["literal", ["Arial"]],
 		"text-justify": "auto",
 		"text-max-width": ["step", ["zoom"], 4, 6, 2],
-		"text-padding": ["step", ["zoom"], 0, 6, 2],
+		"text-padding": ["step", ["zoom"], 0, 6, 1],
 		"text-rotation-alignment": "viewport",
 		"text-size": ["step", ["zoom"], 10, 6, 20],
 		"text-transform": "uppercase",
@@ -1160,4 +1160,11 @@ func TestNotesHaveStableOrder(t *testing.T) {
 			t.Fatalf("notes differ between runs:\n%v\n%v", first.Notes(), m.Notes())
 		}
 	}
+}
+
+// Mapnik keeps a label text-margin away from the boxes of earlier labels;
+// MapLibre pads both boxes, so each gets half.
+func TestTextMarginIsSharedPadding(t *testing.T) {
+	_, style := build(t, `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-margin: 4; }`, "places")
+	assertJSON(t, "padding", layerByID(t, style, "places::::text")["layout"].(map[string]interface{})["text-padding"], `2`)
 }
