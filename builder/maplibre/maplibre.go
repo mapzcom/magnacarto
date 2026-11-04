@@ -94,6 +94,14 @@ type Options struct {
 	// sprite ("x4:Town/circle"). Options.ImageSize then gives the width of
 	// that sprite image. Pattern images are not changed.
 	IconImage func(image string) string
+	// WrapText, if set, returns the feature attribute that holds a text
+	// wrapped as Mapnik wraps it (text-wrap-width, shield-wrap-width), for
+	// a text that Mapnik wraps. The label then reads that attribute and
+	// MapLibre does not wrap it again (text-max-width): MapLibre balances the
+	// lines below the width and does not wrap line labels at all. With ok
+	// false MapLibre wraps the text. LayerInfo.FieldZooms says in which zoom
+	// levels the data needs the attribute.
+	WrapText func(w TextWrap) (field string, ok bool)
 }
 
 // Sprite is one sprite of a style's list of sprites.
@@ -139,6 +147,9 @@ type LayerInfo struct {
 	MinZoom, MaxZoom int
 	// Fields are the sorted feature attributes the style reads.
 	Fields []string
+	// FieldZooms are the lowest and highest MapLibre zoom level in which
+	// the style reads each of the Fields.
+	FieldZooms map[string][2]int
 }
 
 // Map collects the converted layers. It implements builder.Map.
@@ -214,6 +225,7 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 	}
 
 	fields := map[string]bool{}
+	fieldZooms := map[string][2]int{}
 	minZoom, maxZoom := -1, -1
 
 	groups := groupByAttachment(rules)
@@ -249,6 +261,9 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 				for _, f := range sl.fields {
 					fields[f] = true
 				}
+				for f, zr := range sl.fieldZooms {
+					addZooms(fieldZooms, f, zr)
+				}
 				if minZoom < 0 || sl.first < minZoom {
 					minZoom = sl.first
 				}
@@ -261,7 +276,7 @@ func (m *Map) AddLayer(l mml.Layer, rules []mss.Rule) {
 	if minZoom < 0 {
 		return
 	}
-	info := LayerInfo{Layer: l, MinZoom: minZoom, MaxZoom: maxZoom, Fields: []string{}}
+	info := LayerInfo{Layer: l, MinZoom: minZoom, MaxZoom: maxZoom, Fields: []string{}, FieldZooms: fieldZooms}
 	for f := range fields {
 		info.Fields = append(info.Fields, f)
 	}

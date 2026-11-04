@@ -247,7 +247,12 @@ func newShieldConverter() symConverter {
 		label: &labelProps{view: shieldText, placement: map[string]bool{}, repeatDistance: "shield-repeat-distance"},
 	}
 	for k, pc := range textConverter.props {
-		pc.value = viaText(pc.value)
+		if pc.value != nil {
+			pc.value = viaText(pc.value)
+		}
+		if mv := pc.mapValue; mv != nil {
+			pc.mapValue = func(m *Map, p *mss.Properties) (interface{}, bool) { return mv(m, shieldText(p)) }
+		}
 		c.props[shieldName(k)] = pc
 	}
 	// Along a line Mapnik places a shield no closer to one with the same

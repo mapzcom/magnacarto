@@ -314,6 +314,7 @@ type convertedLayer struct {
 	Layer
 	first, last int // MapLibre zoom range, inclusive
 	fields      []string
+	fieldZooms  map[string][2]int // MapLibre zoom range per field
 }
 
 type caseEntry struct {
@@ -425,6 +426,18 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 	if first < 0 {
 		return convertedLayer{}, false
 	}
+	fieldZooms := map[string][2]int{}
+	for _, zv := range zooms {
+		if zv.props == nil {
+			continue
+		}
+		used := map[string]bool{}
+		collectFields(zv.filter, used)
+		collectFields(zv.props, used)
+		for f := range used {
+			addZooms(fieldZooms, f, [2]int{zv.zoom, zv.zoom})
+		}
+	}
 
 	// Only the zoom levels in which the layer draws are relevant.
 	var inRange []zoomValues
@@ -436,9 +449,10 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 
 	id := layerID + "::" + g.name + "::" + instanceName(sym.Instance, strings.TrimSuffix(sym.Name, "-")+suffix)
 	sl := convertedLayer{
-		Layer: Layer{ID: id, Type: conv.layerType},
-		first: first,
-		last:  last,
+		Layer:      Layer{ID: id, Type: conv.layerType},
+		first:      first,
+		last:       last,
+		fieldZooms: fieldZooms,
 	}
 	if first > 0 {
 		sl.MinZoom = intPtr(first)
@@ -742,6 +756,19 @@ func equal(a, b interface{}) bool {
 }
 
 func intPtr(i int) *int { return &i }
+
+// addZooms widens the zoom range of a field to include zr.
+func addZooms(zooms map[string][2]int, field string, zr [2]int) {
+	if old, ok := zooms[field]; ok {
+		if old[0] < zr[0] {
+			zr[0] = old[0]
+		}
+		if old[1] > zr[1] {
+			zr[1] = old[1]
+		}
+	}
+	zooms[field] = zr
+}
 
 // collectFields adds the names of all ["get", name] expressions in v.
 func collectFields(v interface{}, fields map[string]bool) {

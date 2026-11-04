@@ -30,11 +30,10 @@ var textConverter = symConverter{
 		return ok && field != ""
 	},
 	props: map[string]propConv{
-		"text-name":      {target: "text-field", layout: true, value: textFieldValue},
-		"text-face-name": {target: "text-font", layout: true, value: fontValue},
-		"text-size":      {target: "text-size", layout: true, value: floatValue("text-size", 1)},
-		"text-wrap-width": {target: "text-max-width", layout: true, always: true, def: noWrap,
-			value: emValue("text-wrap-width", 0, true)},
+		"text-name":       {target: "text-field", layout: true, mapValue: wrappedTextValue},
+		"text-face-name":  {target: "text-font", layout: true, value: fontValue},
+		"text-size":       {target: "text-size", layout: true, value: floatValue("text-size", 1)},
+		"text-wrap-width": {target: "text-max-width", layout: true, always: true, def: noWrap, mapValue: maxWidthValue},
 		"text-character-spacing": {target: "text-letter-spacing", layout: true, def: 0.0,
 			value: emValue("text-character-spacing", 0, false)},
 		"text-line-spacing": {target: "text-line-height", layout: true, zoomOnly: true, def: defaultLineHeight,
@@ -87,6 +86,69 @@ var textConverter = symConverter{
 		placement:      map[string]bool{"text-placements": true, "text-dx": true, "text-justify-alignment": true},
 		repeatDistance: "text-repeat-distance",
 	},
+}
+
+// TextWrap is a text that Mapnik wraps, see Options.WrapText. Widths and
+// sizes are in pixels.
+type TextWrap struct {
+	// Text is the text-field value without wrapping: a string or an
+	// expression of "get" and "concat".
+	Text      interface{}
+	Width     float64  // text-wrap-width
+	Size      float64  // text-size
+	Fonts     []string // text-face-name, the font stack
+	Transform string   // text-transform, "" for none
+	// Before is text-wrap-before: break before the word that overflows
+	// the width instead of after it.
+	Before bool
+	// Line is true for labels along lines.
+	Line bool
+}
+
+// wrappedTextValue converts text-name; where Options.WrapText provides the
+// wrapped text, the label reads it instead.
+func wrappedTextValue(m *Map, p *mss.Properties) (interface{}, bool) {
+	text, ok := textFieldValue(p)
+	if !ok {
+		return nil, false
+	}
+	if field, wrapped := m.wrapField(p, text); wrapped {
+		return []interface{}{"get", field}, true
+	}
+	return text, true
+}
+
+// maxWidthValue converts text-wrap-width to text-max-width; text wrapped in
+// the data is not wrapped again.
+func maxWidthValue(m *Map, p *mss.Properties) (interface{}, bool) {
+	if text, ok := textFieldValue(p); ok {
+		if _, wrapped := m.wrapField(p, text); wrapped {
+			return noWrap, true
+		}
+	}
+	return emValue("text-wrap-width", 0, true)(p)
+}
+
+// wrapField returns the attribute with the wrapped text from
+// Options.WrapText, if Mapnik wraps the text of the rule.
+func (m *Map) wrapField(p *mss.Properties, text interface{}) (string, bool) {
+	if m.opts.WrapText == nil || text == "" {
+		return "", false
+	}
+	width, ok := p.GetFloat("text-wrap-width")
+	if !ok || width <= 0 {
+		return "", false
+	}
+	fonts, _ := p.GetStringList("text-face-name")
+	transform, _ := p.GetString("text-transform")
+	if transform == "none" {
+		transform = ""
+	}
+	before, _ := p.GetBool("text-wrap-before")
+	return m.opts.WrapText(TextWrap{
+		Text: text, Width: width, Size: textSize(p), Fonts: fonts,
+		Transform: transform, Before: before, Line: isLinePlacement(p),
+	})
 }
 
 var fieldRe = regexp.MustCompile(`\[([^\]]+)\]`)

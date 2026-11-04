@@ -3,6 +3,7 @@ package maplibre
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1167,4 +1168,77 @@ func TestNotesHaveStableOrder(t *testing.T) {
 func TestTextMarginIsSharedPadding(t *testing.T) {
 	_, style := build(t, `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-margin: 4; }`, "places")
 	assertJSON(t, "padding", layerByID(t, style, "places::::text")["layout"].(map[string]interface{})["text-padding"], `2`)
+}
+
+// With Options.WrapText the data holds the wrapped text: the label reads the
+// returned field and MapLibre does not wrap again.
+func TestWrapTextReadsWrappedField(t *testing.T) {
+	opts := testOptions()
+	var got []TextWrap
+	opts.WrapText = func(w TextWrap) (string, bool) {
+		got = append(got, w)
+		return fmt.Sprintf("name_w%g_s%g", w.Width, w.Size), true
+	}
+	m, style := buildMap(t, opts, `
+		#places[zoom>=10] {
+			text-name: '[name]';
+			text-face-name: 'Fira Sans Bold', 'Unifont Medium';
+			text-size: 10; text-wrap-width: 50; text-transform: uppercase;
+			[zoom>=12] { text-size: 20; }
+			[type='nowrap'] { text-wrap-width: 0; }
+		}
+		#roads[zoom>=14] { text-name: [ref]+' '+[name]; text-face-name: 'Arial'; text-size: 9;
+			text-placement: line; text-wrap-width: 30; }
+	`, "places", "roads")
+
+	layout := layerByID(t, style, "places::::text")["layout"].(map[string]interface{})
+	assertJSON(t, "text-field", layout["text-field"], `["step", ["zoom"],
+		["case", ["==", ["get", "type"], "nowrap"], ["get", "name"], ["get", "name_w50_s10"]], 11,
+		["case", ["==", ["get", "type"], "nowrap"], ["get", "name"], ["get", "name_w50_s20"]]]`)
+	assertJSON(t, "text-max-width", layout["text-max-width"], `1000`)
+	assertJSON(t, "roads text-field", layerByID(t, style, "roads::::text")["layout"].(map[string]interface{})["text-field"],
+		`["get", "name_w30_s9"]`)
+
+	want := map[string]TextWrap{
+		"places 10": {Text: []interface{}{"get", "name"}, Width: 50, Size: 10, Fonts: []string{"Fira Sans Bold", "Unifont Medium"}, Transform: "uppercase"},
+		"places 20": {Text: []interface{}{"get", "name"}, Width: 50, Size: 20, Fonts: []string{"Fira Sans Bold", "Unifont Medium"}, Transform: "uppercase"},
+		"roads 9":   {Text: []interface{}{"concat", []interface{}{"get", "ref"}, " ", []interface{}{"get", "name"}}, Width: 30, Size: 9, Fonts: []string{"Arial"}, Line: true},
+	}
+	for _, w := range got {
+		key := "places"
+		if w.Line {
+			key = "roads"
+		}
+		key += fmt.Sprintf(" %g", w.Size)
+		var gw interface{}
+		json.Unmarshal(mustJSON(w), &gw)
+		assertJSON(t, key, gw, string(mustJSON(want[key])))
+	}
+
+	infos := m.Layers()
+	assertJSON(t, "places field zooms", infos[0].FieldZooms, `{
+		"name": [9, 21], "name_w50_s10": [9, 10], "name_w50_s20": [11, 21], "type": [9, 21]}`)
+	assertJSON(t, "roads field zooms", infos[1].FieldZooms, `{"name_w30_s9": [13, 21]}`)
+}
+
+func TestWrapTextForShields(t *testing.T) {
+	opts := testOptions()
+	opts.WrapText = func(w TextWrap) (string, bool) { return "wrapped", w.Width == 40 && w.Size == 10 }
+	style := buildWith(t, opts, `
+		#towns { shield-file: url(Town/circle.svg); shield-name: '[name]'; shield-face-name: 'Arial';
+			shield-size: 10; shield-wrap-width: 40; }
+	`, "towns")
+	layout := layerByID(t, style, "towns::::shield")["layout"].(map[string]interface{})
+	assertJSON(t, "text-field", layout["text-field"], `["get", "wrapped"]`)
+	assertJSON(t, "text-max-width", layout["text-max-width"], `1000`)
+}
+
+// Without a field from Options.WrapText MapLibre wraps as before.
+func TestWrapTextDeclined(t *testing.T) {
+	opts := testOptions()
+	opts.WrapText = func(w TextWrap) (string, bool) { return "", false }
+	style := buildWith(t, opts, `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10; text-wrap-width: 50; }`, "places")
+	layout := layerByID(t, style, "places::::text")["layout"].(map[string]interface{})
+	assertJSON(t, "text-field", layout["text-field"], `["get", "name"]`)
+	assertJSON(t, "text-max-width", layout["text-max-width"], `5`)
 }
