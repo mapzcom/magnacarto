@@ -1148,3 +1148,16 @@ func TestIconDefaults(t *testing.T) {
 	assertJSON(t, "marker spacing", layerByID(t, style, "m::::marker")["layout"].(map[string]interface{})["symbol-spacing"], `100`)
 	assertJSON(t, "shield size", layerByID(t, style, "s::::shield")["layout"].(map[string]interface{})["text-size"], `10`)
 }
+
+// The report must not change between runs.
+func TestNotesHaveStableOrder(t *testing.T) {
+	mss := `#places { text-name: [name]; text-face-name: 'Arial'; text-size: 10;
+		[type='a'] { text-margin: 2; text-line-spacing: 2; text-spacing: 5; text-allow-overlap: true; } }`
+	first, _ := build(t, mss, "places")
+	for i := 0; i < 20; i++ {
+		m, _ := build(t, mss, "places")
+		if !equal(m.Notes(), first.Notes()) {
+			t.Fatalf("notes differ between runs:\n%v\n%v", first.Notes(), m.Notes())
+		}
+	}
+}

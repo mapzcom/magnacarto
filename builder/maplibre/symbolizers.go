@@ -396,7 +396,14 @@ func (m *Map) convertSymbolizer(layerID string, g attachmentGroup, sym mss.Prefi
 			}
 			last, lastMapnik = z, zm
 			zv.props = map[string]interface{}{}
-			for name, entries := range propEntries {
+			// In a fixed order, for a stable order of the notes.
+			propNames := make([]string, 0, len(propEntries))
+			for name := range propEntries {
+				propNames = append(propNames, name)
+			}
+			sort.Strings(propNames)
+			for _, name := range propNames {
+				entries := propEntries[name]
 				// A rule with the condition of an earlier one never
 				// decides, so it cannot be the fallback either.
 				entries = withoutShadowed(entries)
